@@ -288,9 +288,7 @@ bool isTsanAtomic(const Instruction *I) {
 
 bool DominanceBasedElimination::isInstrSafe(const Instruction *Inst) {
   // 1. Atomic operations with inter-thread communication are the primary
-  //    source of synchronization and are NEVER safe. The isTsanAtomic helper
-  //    correctly identifies these (e.g., atomics with a sync scope other
-  //    than SingleThread).
+  //    source of synchronization and are NEVER safe.
   if (isTsanAtomic(Inst))
     return false;
 
@@ -302,7 +300,6 @@ bool DominanceBasedElimination::isInstrSafe(const Instruction *Inst) {
       if (Callee->doesNotAccessMemory() || Callee->onlyReadsMemory() ||
           Callee->hasNoSync())
         return true;
-
       // Conservatively: any non-intrinsic and not explicitly safe call is
       // dangerous
       return false;
@@ -310,10 +307,8 @@ bool DominanceBasedElimination::isInstrSafe(const Instruction *Inst) {
     // Indirect call - always dangerous for simplicity
     return false;
   }
-  // 3. All other instructions (regular loads/stores, arithmetic, GEPs, fences,
-  // etc.) are considered safe because they do not, by themselves, create
-  // happens-before relationships that would break our single-thread
-  // dominance logic.
+  // 3. All other instructions are considered safe because they do not,
+  // by themselves, create happens-before relationships
   return true;
 }
 
@@ -321,38 +316,34 @@ template <bool IsPostDom>
 bool DominanceBasedElimination::isPathClear(
     Instruction *StartInst, Instruction *EndInst,
     const DominatorTreeBase<BasicBlock, IsPostDom> *DTBase) {
-    LLVM_DEBUG(dbgs() << "Checking path from " << *StartInst << " to " << *EndInst
+  LLVM_DEBUG(dbgs() << "Checking path from " << *StartInst << " to " << *EndInst
                     << "\n");
   const BasicBlock *StartBB = StartInst->getParent();
-  const BasicBlock *EndBB = EndInst->getParent();
-  LLVM_DEBUG(dbgs() << "StartBB: " << StartBB->getName() << "\t"
-                    << "EndBB: " << EndBB->getName() << "\n");
+  LLVM_DEBUG(dbgs() << "StartBB: " << StartBB->getName() << "\n");
 
-  // 1. Check instructions in DomBB after DomInst
+  // 1. Check instructions in StartBB after StartInst
   for (const Instruction *I = StartInst->getNextNode();
        I && I->getParent() == StartBB; I = I->getNextNode()) {
     LLVM_DEBUG(dbgs() << "\tisPathClear -- Checking 1: " << *I << "\n");
-    if (I == EndInst && StartBB == EndBB)
-      return true; // Reached target instruction in the same block
     if (!isInstrSafe(I))
       return false;
+    if (I == EndInst)
+      // If both StartInst and EndInst belongs to the same BB, we are done.
+      return true; // Reached target instruction in the same block
   }
-
-  // The path is clear within the same block
-  if (StartBB == EndBB)
-    return true;
 
   // 2. Check blocks on the dominance path between DomBB and CurrBB (excluding
   // DomBB, excluding CurrBB) Traverse up from CurrBB along the immediate
   // dominator tree until DomBB is reached
+  const BasicBlock *EndBB = EndInst->getParent();
   const BasicBlock *CurBB = !IsPostDom ? EndBB : StartBB;
   const BasicBlock *DomBB = !IsPostDom ? StartBB : EndBB;
   const DomTreeNode *CurrNode = DTBase->getNode(CurBB);
   assert(CurrNode && "DomNode not found");
 
-  DomTreeNode *Node = CurrNode->getIDom();
-
-  while (Node && Node->getBlock() && Node->getBlock() != DomBB) {
+  for (DomTreeNode *Node = CurrNode->getIDom();
+       Node && Node->getBlock() && Node->getBlock() != DomBB;
+       Node = Node->getIDom()) {
     BasicBlock *IntermediateBB = Node->getBlock();
     LLVM_DEBUG(dbgs() << "Inter IDom BB " << IntermediateBB->getName() << "\n");
     for (const Instruction &InterI : *IntermediateBB) {
@@ -360,22 +351,6 @@ bool DominanceBasedElimination::isPathClear(
       if (!isInstrSafe(&InterI))
         return false;
     }
-    Node = Node->getIDom();
-  }
-
-  assert(Node && Node->getBlock() && "DomNode not found");
-
-  // If IDomNode->getBlock() became DomBB, then DomBB indeed dominates CurrBB
-  // and we've checked all intermediate blocks on the dominator path.
-  if (!Node || !Node->getBlock() || Node->getBlock() != DomBB) {
-    // This shouldn't happen if DomInst dominates CurrInst.
-    // Perhaps DomInst doesn't strictly dominate CurrInst, or there's a logic
-    // error. Conservatively return false.
-    LLVM_DEBUG(dbgs() << "TSAN: Path integrity issue or DomInst not strictly "
-                         "dominating CurrInst.\n"
-                      << "StartInst: " << *StartInst << "\nEndInst: " << *EndInst
-                      << "\n");
-    return false;
   }
 
   // 3. Check instructions in CurrBB before CurrInst
