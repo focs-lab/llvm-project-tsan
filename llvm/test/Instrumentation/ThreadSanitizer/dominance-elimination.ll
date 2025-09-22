@@ -154,3 +154,124 @@ entry:
 
 ; Attributes for the "safe" intrinsic
 attributes #0 = { nounwind readnone }
+
+; =============================================================================
+; BRANCHING WITH MULTIPLE PATHS (one path dirty)
+; =============================================================================
+
+; Case A: inter-BB with a diamond where one branch is dirty.
+; Path entry -> then (unsafe) -> merge, and entry -> else (safe) -> merge.
+define void @multi_path_inter_dirty(i1 %cond) nounwind uwtable sanitize_thread {
+entry:
+  store i32 1, ptr @g1, align 4
+  br i1 %cond, label %then, label %else
+
+then:
+  call void @some_external_call()
+  br label %merge
+
+else:
+  call void @llvm.donothing()
+  br label %merge
+
+merge:
+  %v = load i32, ptr @g1, align 4
+  ret void
+}
+; CHECK-LABEL: define void @multi_path_inter_dirty
+; CHECK:       entry:
+; CHECK:       call void @__tsan_write4(ptr @g1)
+; Dirty along one path => must instrument at merge.
+; CHECK:       merge:
+; CHECK:       call void @__tsan_read4(ptr @g1)
+; CHECK:       ret void
+
+; Case B: inter-BB where both branches are safe (no dangerous instr). Should eliminate.
+define void @multi_path_inter_clean(i1 %cond) nounwind uwtable sanitize_thread {
+entry:
+  store i32 1, ptr @g1, align 4
+  br i1 %cond, label %then, label %else
+
+then:
+  call void @llvm.donothing()
+  br label %merge
+
+else:
+  call void @llvm.donothing()
+  br label %merge
+
+merge:
+  %v = load i32, ptr @g1, align 4
+  ret void
+}
+; CHECK-LABEL: define void @multi_path_inter_clean
+; CHECK:       entry:
+; CHECK:       call void @__tsan_write4(ptr @g1)
+; Both paths clean => dominated read at merge should be removed.
+; CHECK:       merge:
+; CHECK-NOT:   call void @__tsan_read4(ptr @g1)
+
+; =============================================================================
+; MIXED: intra-BB safe suffix vs. inter-BB dirty path
+; =============================================================================
+define void @mixed_intra_inter(i1 %cond) nounwind uwtable sanitize_thread {
+entry:
+  ; intra-BB suffix between store and next store is safe (no calls)
+  store i32 1, ptr @g1, align 4
+  store i32 2, ptr @g1, align 4
+  br i1 %cond, label %dirty, label %clean
+
+dirty:
+  ; dangerous call on one path
+  call void @some_external_call()
+  br label %merge
+
+clean:
+  ; safe on other path
+  call void @llvm.donothing()
+  br label %merge
+
+merge:
+  ; must keep because one incoming path is dirty
+  store i32 3, ptr @g1, align 4
+  ret void
+}
+; CHECK-LABEL: define void @mixed_intra_inter
+; First store instruments.
+; CHECK:       entry:
+; CHECK:       call void @__tsan_write4(ptr @g1)
+; Second store in same BB is dominated by the first and safe => removed.
+; CHECK-NOT:   call void @__tsan_write4(ptr @g1)
+; Final store must remain due to dirty path.
+; CHECK:       merge:
+; CHECK:       call void @__tsan_write4(ptr @g1)
+
+; =============================================================================
+; POST-DOM with dirty suffix at start BB blocks elimination (renamed BBs)
+; =============================================================================
+define void @postdom_dirty_start_suffix(i1 %cond) nounwind uwtable sanitize_thread {
+entry:
+  ; Initial write
+  store i32 1, ptr @g1, align 4
+  ; Dirty suffix in the start block blocks elimination
+  call void @some_external_call()
+  br i1 %cond, label %path_then, label %path_else
+
+path_then:
+  br label %merge
+
+path_else:
+  br label %merge
+
+merge:
+  ; Despite post-dominance, path is not clear due to dirty suffix in entry
+  %v = load i32, ptr @g1, align 4
+  ret void
+}
+; CHECK-LABEL: define void @postdom_dirty_start_suffix
+; CHECK:       entry:
+; CHECK:       call void @__tsan_write4(ptr @g1)
+; CHECK:       call void @some_external_call()
+; CHECK:       merge:
+; CHECK:       call void @__tsan_read4(ptr @g1)
+; CHECK:       ret void

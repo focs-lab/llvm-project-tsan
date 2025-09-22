@@ -169,7 +169,17 @@ private:
     DenseMap<const BasicBlock *, SmallVector<unsigned, 4>> DangerIdxInBB;
     DenseMap<const BasicBlock *, bool> HasDangerInBB;
     DenseMap<const Instruction *, unsigned> IndexInBB;
+    // Reachability cache: a set of blocks that can reach EndBB.
+    DenseMap<const BasicBlock *, SmallPtrSet<const BasicBlock *, 32>>
+        ReachableToEnd;
+    // Cone safety cache: StartBB -> (EndBB -> pathIsSafe): to avoid custom hash
+    DenseMap<const BasicBlock *, DenseMap<const BasicBlock *, bool>>
+        ConeSafeCache;
   } BSC;
+
+  // Reusable worklists/visited sets to amortize allocations.
+  mutable SmallVector<const BasicBlock *, 32> Worklist;
+  mutable SmallPtrSet<const BasicBlock *, 32> CanReachSet;
 
   void buildBlockSafetyCache(Function &F);
 
@@ -312,6 +322,12 @@ private:
 //-----------------------------------------------------------------------------
 
 void DominanceBasedElimination::buildBlockSafetyCache(Function &F) {
+  // Reserve to reduce rehashing for a typical case.
+  BSC.DangerIdxInBB.reserve(F.size());
+  BSC.HasDangerInBB.reserve(F.size());
+  BSC.ReachableToEnd.reserve(F.size());
+  BSC.ConeSafeCache.reserve(F.size());
+
   for (BasicBlock &BB : F) {
     SmallVector<unsigned, 4> Danger;
     unsigned Idx = 0;
@@ -402,30 +418,42 @@ bool DominanceBasedElimination::isInstrSafe(const Instruction *Inst) {
 
 SmallPtrSet<const BasicBlock *, 32>
 DominanceBasedElimination::buildCanReachEnd(const BasicBlock *EndBB) {
-  SmallPtrSet<const BasicBlock *, 32> CanReachEnd;
-  SmallVector<const BasicBlock *, 32> Worklist;
-  CanReachEnd.insert(EndBB);
+  // Check the cache first.
+  if (const auto CachedIt = BSC.ReachableToEnd.find(EndBB);
+      CachedIt != BSC.ReachableToEnd.end())
+    return CachedIt->second;
+
+  // Reuse VisitedSet as the reachability set.
+  Worklist.clear();
+  CanReachSet.clear();
+
+  CanReachSet.insert(EndBB);
   Worklist.push_back(EndBB);
   while (!Worklist.empty()) {
     const BasicBlock *BB = Worklist.back();
     Worklist.pop_back();
     for (const BasicBlock *Pred : predecessors(BB)) {
-      if (CanReachEnd.insert(Pred).second)
+      if (CanReachSet.insert(Pred).second)
         Worklist.push_back(Pred);
     }
   }
-  return CanReachEnd;
+
+  // Store in the cache and return a copy (DenseMap stores the value internally).
+  BSC.ReachableToEnd[EndBB] = CanReachSet;
+  return BSC.ReachableToEnd[EndBB];
 }
 
 bool DominanceBasedElimination::traverseReachableAndCheckSafety(
     const BasicBlock *StartBB, const BasicBlock *EndBB,
     const SmallPtrSetImpl<const BasicBlock *> &CanReachEnd) {
-  SmallPtrSet<const BasicBlock *, 32> Visited;
-  SmallVector<const BasicBlock *, 32> Worklist;
+  Worklist.clear();
+  CanReachSet.clear();
+
   auto EnqueueNonVisited = [&](const BasicBlock *BB) {
-    if (Visited.insert(BB).second)
+    if (CanReachSet.insert(BB).second)
       Worklist.push_back(BB);
   };
+
   for (const BasicBlock *Succ : successors(StartBB))
     if (CanReachEnd.count(Succ))
       EnqueueNonVisited(Succ);
@@ -473,81 +501,35 @@ bool DominanceBasedElimination::isPathClear(
   const unsigned StartIdx = BSC.IndexInBB.lookup(StartInst);
   const unsigned EndIdx = BSC.IndexInBB.lookup(EndInst);
 
-  // Intra-block case: additionally enforce correct order for (post-)dominance.
+  // Intra-BB: verify (StartInst; EndInst) is safe.
   if (StartBB == EndBB)
-    // Verify interval (StartInst; EndInst) — excluding both ends.
     return intervalSafeSameBB(StartBB, StartIdx + 1, EndIdx);
 
-  // Suffix of the start block after StartInst must be safe.
+  // Quick local checks on edges.
   if (!suffixSafe(StartBB, StartIdx + 1))
     return false;
-
-  // Prefix of the end block before EndInst must be safe.
   if (!prefixSafe(EndBB, EndIdx))
     return false;
+
+  // Cone safety cache lookup.
+  if (const auto OuterIt = BSC.ConeSafeCache.find(StartBB);
+      OuterIt != BSC.ConeSafeCache.end()) {
+    if (const auto InnerIt = OuterIt->second.find(EndBB);
+        InnerIt != OuterIt->second.end()) {
+      LLVM_DEBUG(dbgs() << "isPathClear (cached cone): "
+                        << (InnerIt->second ? "true" : "false") << "\n");
+      return InnerIt->second;
+    }
+  }
 
   // Build the set of blocks that can reach EndBB (reverse traversal).
   const auto CanReachEnd = buildCanReachEnd(EndBB);
 
   // Forward traversal from StartBB, restricted to the cone that reach EndBB.
-  bool ok = traverseReachableAndCheckSafety(StartBB, EndBB, CanReachEnd);
-  LLVM_DEBUG(dbgs() << "isPathClear: " << (ok ? "true" : "false") << "\n");
-  return ok;
+  const bool Res = traverseReachableAndCheckSafety(StartBB, EndBB, CanReachEnd);
+  LLVM_DEBUG(dbgs() << "isPathClear: " << (Res ? "true" : "false") << "\n");
+  return Res;
 }
-
-#if 0
-template <bool IsPostDom>
-bool DominanceBasedElimination::isPathClear(
-    Instruction *StartInst, Instruction *EndInst,
-    const DominatorTreeBase<BasicBlock, IsPostDom> *DTBase) {
-  LLVM_DEBUG(dbgs() << "Checking path from " << *StartInst << " to " << *EndInst
-                    << "\n");
-  const BasicBlock *StartBB = StartInst->getParent();
-  LLVM_DEBUG(dbgs() << "StartBB: " << StartBB->getName() << "\n");
-
-  // 1. Check instructions in StartBB after StartInst
-  for (const Instruction *I = StartInst->getNextNode();
-       I && I->getParent() == StartBB; I = I->getNextNode()) {
-    LLVM_DEBUG(dbgs() << "\tisPathClear -- Checking 1: " << *I << "\n");
-    if (!isInstrSafe(I))
-      return false;
-    if (I == EndInst)
-      // If both StartInst and EndInst belongs to the same BB, we are done.
-      return true; // Reached target instruction in the same block
-  }
-
-  // 2. Check blocks on the dominance path between DomBB and CurrBB (excluding
-  // DomBB, excluding CurrBB) Traverse up from CurrBB along the immediate
-  // dominator tree until DomBB is reached
-  const BasicBlock *EndBB = EndInst->getParent();
-  const BasicBlock *CurBB = !IsPostDom ? EndBB : StartBB;
-  const BasicBlock *DomBB = !IsPostDom ? StartBB : EndBB;
-  const DomTreeNode *CurrNode = DTBase->getNode(CurBB);
-  assert(CurrNode && "DomNode not found");
-
-  for (DomTreeNode *Node = CurrNode->getIDom();
-       Node && Node->getBlock() && Node->getBlock() != DomBB;
-       Node = Node->getIDom()) {
-    BasicBlock *IntermediateBB = Node->getBlock();
-    LLVM_DEBUG(dbgs() << "Inter IDom BB " << IntermediateBB->getName() << "\n");
-    for (const Instruction &InterI : *IntermediateBB) {
-      LLVM_DEBUG(dbgs() << "\tisPathClear -- Checking 2: " << InterI << "\n");
-      if (!isInstrSafe(&InterI))
-        return false;
-    }
-  }
-
-  // 3. Check instructions in CurrBB before CurrInst
-  for (const Instruction &I : *EndBB) {
-    LLVM_DEBUG(dbgs() << "\tisPathClear -- Checking 3: " << I << "\n");
-    if (&I == EndInst)
-      break;
-    if (!isInstrSafe(&I))
-      return false;
-  }
-  return true;
-}
-#endif
 
 DenseMap<Instruction *, size_t>
 DominanceBasedElimination::createInstrToIndexMap() const {
@@ -692,17 +674,6 @@ void DominanceBasedElimination::eliminate() {
       return *ToRemoveIter++;
     });
 
-    // erase_if(AllInstr, [&](const InstructionInfo &II) {
-    //   size_t Index = InstrIndexMap.lookup(II.Inst);
-    //   return ToRemove[Index];
-    // });
-
-    // SmallVector<InstructionInfo, 8> NewAllInstr;
-    // NewAllInstr.reserve(AllInstr.size() - RemovedCount);
-    // for (size_t k = 0; k < AllInstr.size(); ++k)
-    //   if (!ToRemove[k])
-    //     NewAllInstr.push_back(AllInstr[k]);
-    // AllInstr.swap(NewAllInstr);
     if constexpr (IsPostDom)
       NumOmittedByPostDominance += RemovedCount; // Statistics
     else
