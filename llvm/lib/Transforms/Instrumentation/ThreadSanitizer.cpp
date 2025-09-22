@@ -550,7 +550,6 @@ bool DominanceBasedElimination::findAndMarkDominatingInstr(
   const BasicBlock *CurrBB = CurrInst->getParent();
   Value *CurrAddr = getLoadStorePointerOperand(CurrInst);
   assert(CurrAddr && "Should not happen for load/store");
-  const Value *CurrUnderlyingObj = getUnderlyingObject(CurrAddr);
 
   DomTreeNode *CurrDTNode = DTBase->getNode(CurrBB);
   if (!CurrDTNode)
@@ -588,10 +587,7 @@ bool DominanceBasedElimination::findAndMarkDominatingInstr(
       Instruction *DomInst = DomII.Inst;
 
       const Value *DomAddr = getLoadStorePointerOperand(DomInst);
-      const Value *DomUnderlyingObj = getUnderlyingObject(DomAddr);
-      if (CurrUnderlyingObj == DomUnderlyingObj ||
-          (CurrUnderlyingObj && DomUnderlyingObj &&
-           AA.isMustAlias(CurrAddr, DomAddr))) {
+      if (AA.isMustAlias(CurrAddr, DomAddr)) {
         auto isWriteOperation = [](const InstructionInfo &II) {
           return isa<StoreInst>(II.Inst) ||
                  (II.Flags & InstructionInfo::kCompoundRW);
