@@ -140,6 +140,7 @@ if.end:
 ; ALIAS ANALYSIS TESTS
 ; =============================================================================
 
+; Simple alias analysis: no alias.
 define void @test_no_alias() nounwind uwtable sanitize_thread {
 entry:
   store i32 1, ptr @g1, align 4
@@ -152,8 +153,128 @@ entry:
 ; CHECK:      call void @__tsan_write4(ptr @g2)
 ; CHECK:      ret void
 
-; Attributes for the "safe" intrinsic
-attributes #0 = { nounwind readnone }
+; MustAlias via zero-index GEP (should eliminate)
+define void @alias_mustalias_gep0() nounwind uwtable sanitize_thread {
+entry:
+  store i32 1, ptr @g1, align 4
+  %p = getelementptr i32, ptr @g1, i64 0
+  %v = load i32, ptr %p, align 4
+  ret void
+}
+; CHECK-LABEL: define void @alias_mustalias_gep0
+; CHECK:       entry:
+; CHECK:       call void @__tsan_write4(ptr @g1)
+; CHECK-NOT:   call void @__tsan_read4(ptr @g1)
+; CHECK:       ret void
+
+; Different offsets within the same base object (should NOT eliminate)
+@arr = common global [5 x i32] zeroinitializer, align 4
+define void @alias_different_offsets() nounwind uwtable sanitize_thread {
+entry:
+  %p0 = getelementptr [5 x i32], ptr @arr, i64 0, i64 0
+  %p1 = getelementptr [5 x i32], ptr @arr, i64 0, i64 1
+  store i32 1, ptr %p0, align 4
+  store i32 2, ptr %p1, align 4
+  ret void
+}
+; CHECK-LABEL: define void @alias_different_offsets
+; CHECK:       call void @__tsan_write4(
+; CHECK:       call void @__tsan_write4(
+; CHECK:       ret void
+
+; Equal offsets within the same base object (should eliminate)
+define void @alias_same_offsets() nounwind uwtable sanitize_thread {
+entry:
+  %p0 = getelementptr [5 x i32], ptr @arr, i64 0, i64 1
+  %p1 = getelementptr [5 x i32], ptr @arr, i64 0, i64 1
+  store i32 1, ptr %p0, align 4
+  store i32 2, ptr %p1, align 4
+  ret void
+}
+; CHECK-LABEL: define void @alias_same_offsets
+; CHECK:       call void @__tsan_write4(
+; CHECK-NOT:   call void @__tsan_write4(
+; CHECK:       ret void
+
+
+; MayAlias via phi of two globals (should NOT eliminate)
+define void @alias_mayalias_phi(i1 %c) nounwind uwtable sanitize_thread {
+entry:
+  store i32 1, ptr @g1, align 4
+  br i1 %c, label %A, label %B
+A:
+  br label %join
+B:
+  br label %join
+join:
+  %p = phi ptr [ @g1, %A ], [ @g2, %B ]
+  %v = load i32, ptr %p, align 4
+  ret void
+}
+; CHECK-LABEL: define void @alias_mayalias_phi
+; CHECK:       entry:
+; CHECK:       call void @__tsan_write4(ptr @g1)
+; CHECK:       join:
+; CHECK:       call void @__tsan_read4(
+; CHECK:       ret void
+
+; Pointer round-trip via ptrtoint/inttoptr (typically breaks MustAlias)
+; (should NOT eliminate)
+define void @alias_ptr_roundtrip() nounwind uwtable sanitize_thread {
+entry:
+  store i32 1, ptr @g1, align 4
+  %i = ptrtoint ptr @g1 to i64
+  %p2 = inttoptr i64 %i to ptr
+  %v = load i32, ptr %p2, align 4
+  ret void
+}
+; CHECK-LABEL: define void @alias_ptr_roundtrip
+; CHECK:       entry:
+; CHECK:       call void @__tsan_write4(ptr @g1)
+; CHECK:       call void @__tsan_read4(
+; CHECK:       ret void
+
+; Bitcast-based MustAlias (i32* <-> i8*) (should eliminate)
+define void @alias_bitcast_i8_i32() nounwind uwtable sanitize_thread {
+entry:
+  store i32 1, ptr @g1, align 4
+  %p8 = bitcast ptr @g1 to ptr
+  %v = load i32, ptr %p8, align 4
+  ret void
+}
+; CHECK-LABEL: define void @alias_bitcast_i8_i32
+; CHECK:       entry:
+; CHECK:       call void @__tsan_write4(ptr @g1)
+; CHECK-NOT:   call void @__tsan_read4(ptr @g1)
+; CHECK:       ret void
+
+; GEP with folded zero offset is MustAlias: (%n - %n) -> 0
+define void @alias_gep_folded_zero(i64 %n) nounwind uwtable sanitize_thread {
+entry:
+  store i32 1, ptr @g1, align 4
+  %t = sub i64 %n, %n
+  %p = getelementptr i32, ptr @g1, i64 %t
+  %v = load i32, ptr %p, align 4
+  ret void
+}
+; CHECK-LABEL: define void @alias_gep_folded_zero
+; CHECK:       entry:
+; CHECK:       call void @__tsan_write4(ptr @g1)
+; CHECK-NOT:   call void @__tsan_read4(ptr @g1)
+; CHECK:       ret void
+
+define void @alias_select_same_ptr(i1 %c) nounwind uwtable sanitize_thread {
+entry:
+  store i32 1, ptr @g1, align 4
+  %p = select i1 %c, ptr @g1, ptr @g1
+  %v = load i32, ptr %p, align 4
+  ret void
+}
+; CHECK-LABEL: define void @alias_select_same_ptr
+; CHECK:       entry:
+; CHECK:       call void @__tsan_write4(ptr @g1)
+; CHECK-NOT:   call void @__tsan_read4(ptr @g1)
+; CHECK:       ret void
 
 ; =============================================================================
 ; BRANCHING WITH MULTIPLE PATHS (one path dirty)
@@ -210,6 +331,7 @@ merge:
 ; Both paths clean => dominated read at merge should be removed.
 ; CHECK:       merge:
 ; CHECK-NOT:   call void @__tsan_read4(ptr @g1)
+; CHECK:       ret void
 
 ; =============================================================================
 ; MIXED: intra-BB safe suffix vs. inter-BB dirty path
@@ -245,6 +367,7 @@ merge:
 ; Final store must remain due to dirty path.
 ; CHECK:       merge:
 ; CHECK:       call void @__tsan_write4(ptr @g1)
+; CHECK:       ret void
 
 ; =============================================================================
 ; POST-DOM with dirty suffix at start BB blocks elimination (renamed BBs)
@@ -321,10 +444,13 @@ end:
   %v = load i32, ptr @g1, align 4
   ret void
 }
+; The dirty path is outside the cone to %end, so read can be eliminated.
 ; CHECK-LABEL: define void @dirty_unrelated_cone
 ; CHECK:       entry:
 ; CHECK:       call void @__tsan_write4(ptr @g1)
-; The dirty path is outside the cone to %end, so read can be eliminated.
 ; CHECK:       end:
 ; CHECK-NOT:   call void @__tsan_read4(ptr @g1)
 ; CHECK:       ret void
+
+; Attributes for the "safe" intrinsic
+attributes #0 = { nounwind readnone }
