@@ -275,3 +275,56 @@ merge:
 ; CHECK:       merge:
 ; CHECK:       call void @__tsan_read4(ptr @g1)
 ; CHECK:       ret void
+
+; =============================================================================
+; DIRTY PREFIX IN END BB blocks elimination (prefixSafe)
+; =============================================================================
+define void @dirty_prefix_in_end_bb() nounwind uwtable sanitize_thread {
+entry:
+  store i32 1, ptr @g1, align 4
+  br label %end
+
+end:
+  ; Dirty prefix in the end block before the target access
+  call void @some_external_call()
+  %v = load i32, ptr @g1, align 4
+  ret void
+}
+; CHECK-LABEL: define void @dirty_prefix_in_end_bb
+; CHECK:       entry:
+; CHECK:       call void @__tsan_write4(ptr @g1)
+; CHECK:       end:
+; CHECK:       call void @some_external_call()
+; CHECK:       call void @__tsan_read4(ptr @g1)
+; CHECK:       ret void
+
+; =============================================================================
+; IRRELEVANT DIRTY PATH NOT REACHING EndBB should not block elimination
+; =============================================================================
+define void @dirty_unrelated_cone(i1 %cond) nounwind uwtable sanitize_thread {
+entry:
+  store i32 1, ptr @g1, align 4
+  br i1 %cond, label %to_end, label %to_dead
+
+to_end:
+  br label %end
+
+to_dead:
+  ; Dirty path that does NOT reach %end at all
+  call void @some_external_call()
+  br label %dead
+
+dead:
+  ret void
+
+end:
+  %v = load i32, ptr @g1, align 4
+  ret void
+}
+; CHECK-LABEL: define void @dirty_unrelated_cone
+; CHECK:       entry:
+; CHECK:       call void @__tsan_write4(ptr @g1)
+; The dirty path is outside the cone to %end, so read can be eliminated.
+; CHECK:       end:
+; CHECK-NOT:   call void @__tsan_read4(ptr @g1)
+; CHECK:       ret void
