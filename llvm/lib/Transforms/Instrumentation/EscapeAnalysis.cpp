@@ -11,17 +11,11 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "EscapeAnalysis.h"
-#include "llvm/ADT/DenseMap.h"
-#include "llvm/ADT/DenseSet.h"
-#include "llvm/ADT/SmallVector.h"
+#include "llvm/Transforms/Instrumentation/EscapeAnalysis.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/Analysis/AliasAnalysis.h"
 #include "llvm/Analysis/ValueTracking.h"
-#include "llvm/IR/Dominators.h"
 #include "llvm/IR/InstIterator.h"
-#include "llvm/IR/Instructions.h"
-#include "llvm/IR/PassManager.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 
@@ -31,126 +25,47 @@ using namespace llvm;
 
 STATISTIC(NumAllocationsAnalyzed, "Number of allocation sites analyzed");
 STATISTIC(NumAllocationsEscaped, "Number of allocation sites found to escape");
-STATISTIC(NumWorklistIterations, "Number of worklist iterations");
 
-// A debug option to limit the complexity of the analysis.
+/// Per-allocation worklist cap (safety valve). If the number of processed
+/// worklist nodes exceeds this limit, the analysis bails out conservatively and
+/// considers the allocation as escaping.
 static cl::opt<unsigned>
 WorklistLimit("escape-analysis-worklist-limit", cl::init(10000), cl::Hidden,
-              cl::desc("Worklist limit for escape analysis solver"));
-
-namespace {
-
-/// EscapeAnalysisSolver - This class implements the actual backward dataflow
-/// analysis for a single allocation site. It is hidden from the public API.
-class EscapeAnalysisSolver {
-  Function &F;
-  AAResults &AA;
-
-  SmallVector<const Value *, 16> Worklist;
-  DenseSet<const Value *> EscapedSet;
-
-public:
-  EscapeAnalysisSolver(Function &F, AAResults &AA)
-      : F(F), AA(AA) {}
-
-  bool run(const Value &AllocationSite);
-
-private:
-  void applyTransferFunction(const Instruction &I);
-  bool isMallocLike(const Value *V) const;
-};
-
-} // end anonymous namespace
-
-/// The private implementation of the EscapeAnalysis class.
-struct EscapeAnalysis::Implementation {
-  Function &F;
-  FunctionAnalysisManager &FAM;
-
-  // Cache for analysis results. Key is the allocation site.
-  DenseMap<const Value *, bool> Cache;
-
-  Implementation(Function &F, FunctionAnalysisManager &FAM)
-      : F(F), FAM(FAM) {}
-};
-
-EscapeAnalysis::EscapeAnalysis(Function &F, FunctionAnalysisManager &FAM)
-    : Impl(new Implementation(F, FAM)) {}
-
-EscapeAnalysis::~EscapeAnalysis() = default;
-
-bool EscapeAnalysis::isEscaping(const Value &Allocation) {
-  // 1. Get the underlying object. This handles bitcasts and GEPs.
-  const Value *UnderlyingObject = getUnderlyingObject(&Allocation);
-
-  // 2. Check cache for a previously computed result.
-  auto CacheIt = Impl->Cache.find(UnderlyingObject);
-  if (CacheIt != Impl->Cache.end()) {
-    return CacheIt->second;
-  }
-
-  // 3. If not in cache, run the analysis.
-  LLVM_DEBUG(dbgs() << "EscapeAnalysis: Analyzing " << *UnderlyingObject << "\n");
-  NumAllocationsAnalyzed++;
-
-  // Lazily get other analyses from the FAM.
-  AAResults &AA = Impl->FAM.getResult<AAManager>(Impl->F);
-
-  EscapeAnalysisSolver Solver(Impl->F, AA);
-  bool Result = Solver.run(*UnderlyingObject);
-
-  if (Result) {
-    NumAllocationsEscaped++;
-    LLVM_DEBUG(dbgs() << "  -> Result: ESCAPES\n");
-  } else {
-    LLVM_DEBUG(dbgs() << "  -> Result: DOES NOT ESCAPE\n");
-  }
-
-  // 4. Store result in cache and return.
-  return Impl->Cache[UnderlyingObject] = Result;
-}
+              cl::desc("Max number of worklist nodes processed per allocation; "
+                       "if exceeded, assume the allocation escapes"));
 
 //===----------------------------------------------------------------------===//
-// EscapeAnalysisSolver Implementation
+// EscapeAnalysis Implementation
 //===----------------------------------------------------------------------===//
 
-bool EscapeAnalysisSolver::isMallocLike(const Value *V) const {
-  if (const CallBase *CB = dyn_cast<CallBase>(V)) {
-    if (Function *F = CB->getCalledFunction()) {
-      if (F->getName() == "malloc" || F->getName() == "_Znwm" /* new */) {
-        return true;
-      }
-    }
-  }
-  return false;
-}
-
-void EscapeAnalysisSolver::applyTransferFunction(const Instruction &I) {
+void EscapeAnalysisInfo::applyTransferFunction(
+    const Instruction *I, SmallVectorImpl<const Value *> &Worklist,
+    DenseSet<const Value *> &EscapedSet) {
   // This is a backward analysis. We check if the instruction's *result* is in
   // the EscapedSet. If so, we propagate the "escaped" property to its operands.
 
-  if (!EscapedSet.count(&I)) {
+  if (!EscapedSet.count(I))
     return; // This instruction doesn't produce an escaped value.
-  }
 
   // The value produced by I escapes. Remove it from the set and add its
   // relevant operands, propagating the escaped property backward.
-  EscapedSet.erase(&I);
+  EscapedSet.erase(I);
 
-  if (isa<GetElementPtrInst>(&I) || isa<BitCastInst>(&I) || isa<SelectInst>(&I)) {
+  if (isa<GetElementPtrInst>(I) || isa<BitCastInst>(I) ||
+      isa<SelectInst>(I)) {
     // Simple propagation: if a GEP/cast/select result escapes, the base
     // pointer/operands escape.
-    for (const Value *Op : I.operands()) {
-      if (Op->getType()->isPointerTy())
-        Worklist.push_back(Op);
+    for (const Use &Op : I->operands()) {
+      const Value *V = Op.get();
+      if (V->getType()->isPointerTy())
+        Worklist.push_back(V);
     }
-  } else if (const PHINode *PN = dyn_cast<PHINode>(&I)) {
+  } else if (const PHINode *PN = dyn_cast<PHINode>(I)) {
     // For a PHI node, all incoming values are considered to escape.
-    for (const Value *V : PN->incoming_values()) {
-        if (V->getType()->isPointerTy())
+    for (const Use &V : PN->incoming_values())
+        if (V.get()->getType()->isPointerTy())
             Worklist.push_back(V);
-    }
-  } else if (const LoadInst *LI = dyn_cast<LoadInst>(&I)) {
+  } else if (const LoadInst *LI = dyn_cast<LoadInst>(I)) {
     // If a loaded pointer escapes, the pointer it was loaded from also escapes.
     // This is a key part of handling indirect escapes.
     Worklist.push_back(LI->getPointerOperand());
@@ -158,11 +73,13 @@ void EscapeAnalysisSolver::applyTransferFunction(const Instruction &I) {
   // For other instructions (e.g., binary operators), we stop propagation.
 }
 
-bool EscapeAnalysisSolver::run(const Value &AllocationSite) {
+bool EscapeAnalysisInfo::solveEscapeFor(const Value &AllocationSite) {
   // Find all initial escape points for the allocation.
   // We use LLVM's built-in CaptureTracking as a powerful first-pass filter.
   // It's fast but not flow-sensitive, so it might miss indirect escapes that
   // our dataflow analysis will catch.
+  SmallVector<const Value *, 16> Worklist;
+  DenseSet<const Value *> EscapedSet;
 
   SmallVector<Use *, 16> Uses;
   for (const Use &U : AllocationSite.uses())
@@ -170,15 +87,17 @@ bool EscapeAnalysisSolver::run(const Value &AllocationSite) {
 
   while (!Uses.empty()) {
     Use *U = Uses.pop_back_val();
-    Instruction *User = cast<Instruction>(U->getUser());
+    Instruction *User = dyn_cast<Instruction>(U->getUser());
+    // Some users (e.g. ConstantExpr) are not Instructions; skip them safely.
+    if (!User)
+      continue;
 
     // 1. Direct escape points
     if (isa<ReturnInst>(User)) return true;
     if (isa<StoreInst>(User) && U->get() == cast<StoreInst>(User)->getValueOperand()) {
         const StoreInst *SI = cast<StoreInst>(User);
-        if (isa<GlobalVariable>(getUnderlyingObject(SI->getPointerOperand()))) {
+        if (isa<GlobalVariable>(getUnderlyingObject(SI->getPointerOperand())))
             return true; // Stored to a global.
-        }
     }
     if (CallBase *CB = dyn_cast<CallBase>(User)) {
       if (!CB->isArgOperand(U) || CB->doesNotCapture(CB->getArgOperandNo(U))) {
@@ -191,42 +110,130 @@ bool EscapeAnalysisSolver::run(const Value &AllocationSite) {
     // 2. Add indirect uses to the worklist for dataflow analysis
     // If the allocation is stored, the address where it's stored becomes
     // a source of potential escapes.
-    if (isa<StoreInst>(User) && U->get() == cast<StoreInst>(User)->getValueOperand()) {
+    if (isa<StoreInst>(User) &&
+        U->get() == cast<StoreInst>(User)->getValueOperand())
       Worklist.push_back(cast<StoreInst>(User)->getPointerOperand());
-    }
 
     // 3. Propagate through pointer-like instructions
-    for (const Use &UserUse : User->uses()) {
-        Uses.push_back(const_cast<Use*>(&UserUse));
-    }
+    for (const Use &UserUse : User->uses())
+      Uses.push_back(const_cast<Use *>(&UserUse));
   }
 
   // Now, run the backward dataflow analysis for indirect escapes.
   // The worklist is seeded with pointers that store our allocation.
+  unsigned Iter = 0;
   while (!Worklist.empty()) {
-    NumWorklistIterations++;
-    if (NumWorklistIterations > WorklistLimit) {
-        // Analysis is too complex, conservatively assume it escapes.
-        return true;
+    // Safety valve against pathological def-use graphs.
+    if (++Iter > WorklistLimit) {
+      LLVM_DEBUG(dbgs() << "[EA] worklist limit exceeded (" << WorklistLimit
+                        << ") for allocation site: " << AllocationSite << "\n");
+      // Too complex: conservatively assume it escapes.
+      return true;
     }
 
     const Value *V = Worklist.pop_back_val();
     if (!V || !V->getType()->isPointerTy()) continue;
-    if (isa<Constant>(V)) continue; // Constants can't be part of a def-use chain we care about.
+    if (isa<Constant>(V)) continue; // Constants can't be part of a def-use
+                                    // chain we care about.
     if (!EscapedSet.insert(V).second) continue; // Already processed.
 
-    if (const Argument *Arg = dyn_cast<Argument>(V)) {
-        // If an escaped value can be traced back to a function argument,
-        // it means the allocation was stored in a location pointed to by
-        // that argument. Since we can't know where that argument points,
-        // we must conservatively assume it escapes.
-        return true;
-    }
+    if (const auto *Arg = dyn_cast<Argument>(V))
+      // If an escaped value can be traced back to a function argument,
+      // it means the allocation was stored in a location pointed to by
+      // that argument. Since we can't know where that argument points,
+      // we must conservatively assume it escapes.
+      return true;
 
-    if (const Instruction *I = dyn_cast<Instruction>(V)) {
-      applyTransferFunction(*I);
-    }
+    if (const auto *I = dyn_cast<Instruction>(V))
+      applyTransferFunction(I, Worklist, EscapedSet);
   }
 
   return false;
 }
+
+bool EscapeAnalysisInfo::isEscaping(const Value &Allocation) {
+  // 1. Get the underlying object. This handles bitcasts and GEPs.
+  const Value *UnderlyingObj = getUnderlyingObject(&Allocation);
+
+  // 2. Check cache for a previously computed result.
+  const auto CacheIt = Cache.find(UnderlyingObj);
+  if (CacheIt != Cache.end())
+    return CacheIt->second;
+
+  // 3. If not in cache, run the analysis.
+  LLVM_DEBUG(dbgs() << "EscapeAnalysis: Analyzing " << *UnderlyingObj << "\n");
+  NumAllocationsAnalyzed++;
+
+  // Lazily get other analyses from the FAM.
+  // AAResults &AA = FAM.getResult<AAManager>(F);
+
+  const bool Result = solveEscapeFor(*UnderlyingObj);
+
+  if (Result) {
+    NumAllocationsEscaped++;
+    LLVM_DEBUG(dbgs() << "  -> Result: ESCAPES\n");
+  } else {
+    LLVM_DEBUG(dbgs() << "  -> Result: DOES NOT ESCAPE\n");
+  }
+
+  // 4. Store result in cache and return.
+  return Cache[UnderlyingObj] = Result;
+}
+
+bool EscapeAnalysisInfo::invalidate(Function &F, const PreservedAnalyses &PA,
+                                    FunctionAnalysisManager::Invalidator &Inv) {
+  if (!PA.getChecker<EscapeAnalysis>().preserved())
+    return true;
+
+  // If dependant analysis invalidated - invalidate too
+  // if (Inv.invalidate<AAManager>(F, PA)) return true;
+  return false;
+}
+
+
+AnalysisKey EscapeAnalysis::Key;
+
+EscapeAnalysis::Result EscapeAnalysis::run(Function &F,
+                                           FunctionAnalysisManager &FAM) {
+  EscapeAnalysisInfo EAI(F, FAM);
+  return EAI;
+}
+
+//===----------------------------------------------------------------------===//
+// Printing Pass for Verification
+//===----------------------------------------------------------------------===//
+
+PreservedAnalyses
+EscapeAnalysisPrinterPass::run(Function &F, FunctionAnalysisManager &AM) const {
+  if (F.isDeclaration())
+    return PreservedAnalyses::all();
+
+  dbgs() << "EscapeAnalysis for function: " << F.getName() << "\n";
+
+  bool HasInterestingAllocs = false;
+  auto &EA = AM.getResult<EscapeAnalysis>(F);
+
+  for (Instruction &I : instructions(F)) {
+    bool IsAllocation = false;
+    if (isa<AllocaInst>(I)) {
+      IsAllocation = true;
+    } else if (const auto *CB = dyn_cast<CallBase>(&I)) {
+      if (const Function *Callee = CB->getCalledFunction())
+        if (Callee->getName() == "malloc")
+          IsAllocation = true;
+    }
+
+    if (IsAllocation) {
+      HasInterestingAllocs = true;
+      const bool Escapes = EA.isEscaping(I);
+      dbgs() << "  Allocation " << I.getName() << ": "
+             << (Escapes ? "ESCAPES" : "DOES NOT ESCAPE") << "\n";
+    }
+  }
+
+  if (!HasInterestingAllocs)
+    dbgs() << "  No allocations to analyze.\n";
+
+  return PreservedAnalyses::all();
+}
+
