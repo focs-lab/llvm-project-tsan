@@ -43,7 +43,7 @@ struct EscapeAnalysisInfo {
   ~EscapeAnalysisInfo() = default;
 
   /// Return true if \p Allocation may escape the function.
-  bool isEscaping(const Value &Allocation);
+  bool isEscaping(const Value &Alloc);
 
   bool invalidate(Function &F, const PreservedAnalyses &PA,
                   FunctionAnalysisManager::Invalidator &Inv);
