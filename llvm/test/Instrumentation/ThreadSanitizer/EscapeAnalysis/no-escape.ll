@@ -10,5 +10,5 @@ entry:
   ret void
 }
 
-; CHECK-LABEL: EscapeAnalysisTestPass for function: no_escape
+; CHECK-LABEL: EscapeAnalysis for function: no_escape
 ; CHECK-NEXT:    Allocation p: DOES NOT ESCAPE

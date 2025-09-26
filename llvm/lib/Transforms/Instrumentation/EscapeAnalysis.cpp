@@ -14,6 +14,8 @@
 #include "llvm/Transforms/Instrumentation/EscapeAnalysis.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/Analysis/AliasAnalysis.h"
+#include "llvm/Analysis/MemoryBuiltins.h"
+#include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/Support/CommandLine.h"
@@ -151,9 +153,10 @@ bool EscapeAnalysisInfo::solveEscapeFor(const Value &AllocationSite) {
   return false;
 }
 
-bool EscapeAnalysisInfo::isEscaping(const Value &Allocation) {
-  // 1. Get the underlying object. This handles bitcasts and GEPs.
-  const Value *UnderlyingObj = getUnderlyingObject(&Allocation);
+bool EscapeAnalysisInfo::isEscaping(const Value &Alloc) {
+  // 1. Get the underlying object. This handles bitcasts, GEPs, and
+  //    simple cases of PHIs and selects pointing to the same object.
+  const Value *UnderlyingObj = getUnderlyingObjectAggressive(&Alloc);
 
   // 2. Check cache for a previously computed result.
   const auto CacheIt = Cache.find(UnderlyingObj);
@@ -212,15 +215,15 @@ EscapeAnalysisPrinterPass::run(Function &F, FunctionAnalysisManager &AM) const {
 
   bool HasInterestingAllocs = false;
   auto &EA = AM.getResult<EscapeAnalysis>(F);
+  auto &TLI = AM.getResult<TargetLibraryAnalysis>(F);
 
   for (Instruction &I : instructions(F)) {
     bool IsAllocation = false;
     if (isa<AllocaInst>(I)) {
       IsAllocation = true;
     } else if (const auto *CB = dyn_cast<CallBase>(&I)) {
-      if (const Function *Callee = CB->getCalledFunction())
-        if (Callee->getName() == "malloc")
-          IsAllocation = true;
+      if (isAllocationFn(&I, &TLI) || isNewLikeFn(&I, &TLI))
+        IsAllocation = true;
     }
 
     if (IsAllocation) {
