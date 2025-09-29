@@ -53,8 +53,7 @@ void EscapeAnalysisInfo::applyTransferFunction(
   // relevant operands, propagating the escaped property backward.
   EscapedSet.erase(I);
 
-  if (isa<GetElementPtrInst>(I) || isa<BitCastInst>(I) ||
-      isa<SelectInst>(I)) {
+  if (isa<GetElementPtrInst>(I) || isa<BitCastInst>(I) || isa<SelectInst>(I)) {
     // Simple propagation: if a GEP/cast/select result escapes, the base
     // pointer/operands escape.
     for (const Use &Op : I->operands()) {
@@ -65,8 +64,8 @@ void EscapeAnalysisInfo::applyTransferFunction(
   } else if (const PHINode *PN = dyn_cast<PHINode>(I)) {
     // For a PHI node, all incoming values are considered to escape.
     for (const Use &V : PN->incoming_values())
-        if (V.get()->getType()->isPointerTy())
-            Worklist.push_back(V);
+      if (V.get()->getType()->isPointerTy())
+        Worklist.push_back(V);
   } else if (const LoadInst *LI = dyn_cast<LoadInst>(I)) {
     // If a loaded pointer escapes, the pointer it was loaded from also escapes.
     // This is a key part of handling indirect escapes.
@@ -87,41 +86,41 @@ bool EscapeAnalysisInfo::solveEscapeFor(const Value &AllocationSite) {
   for (const Use &U : AllocationSite.uses())
     Uses.push_back(const_cast<Use*>(&U));
 
+  // I) Fast search for direct escapes by use-def chain and collect possible
+  // sources of indirect escapes.
   while (!Uses.empty()) {
-    Use *U = Uses.pop_back_val();
-    Instruction *User = dyn_cast<Instruction>(U->getUser());
+    const Use *U = Uses.pop_back_val();
+    const auto *User = dyn_cast<Instruction>(U->getUser());
     // Some users (e.g. ConstantExpr) are not Instructions; skip them safely.
     if (!User)
       continue;
 
     // 1. Direct escape points
-    if (isa<ReturnInst>(User)) return true;
-    if (isa<StoreInst>(User) && U->get() == cast<StoreInst>(User)->getValueOperand()) {
-        const StoreInst *SI = cast<StoreInst>(User);
-        if (isa<GlobalVariable>(getUnderlyingObject(SI->getPointerOperand())))
-            return true; // Stored to a global.
-    }
-    if (CallBase *CB = dyn_cast<CallBase>(User)) {
-      if (!CB->isArgOperand(U) || CB->doesNotCapture(CB->getArgOperandNo(U))) {
-        // Not a captured argument, continue.
-      } else {
-        return true; // Passed to a capturing function.
-      }
+    if (isa<ReturnInst>(User))
+      return true; // a) Return the address
+
+    if (const auto *SI = dyn_cast<StoreInst>(User);
+        SI && U->get() == SI->getValueOperand()) {
+      if (isa<GlobalVariable>(getUnderlyingObject(SI->getPointerOperand())))
+        return true; // b) Store to a global
+
+      // Add indirect uses to the worklist for dataflow analysis
+      // If the allocation is stored, the address where it's stored becomes
+      // a source of potential escapes.
+      Worklist.push_back(cast<StoreInst>(User)->getPointerOperand());
     }
 
-    // 2. Add indirect uses to the worklist for dataflow analysis
-    // If the allocation is stored, the address where it's stored becomes
-    // a source of potential escapes.
-    if (isa<StoreInst>(User) &&
-        U->get() == cast<StoreInst>(User)->getValueOperand())
-      Worklist.push_back(cast<StoreInst>(User)->getPointerOperand());
+    if (const CallBase *CB = dyn_cast<CallBase>(User)) {
+      if (CB->isArgOperand(U) && !CB->doesNotCapture(CB->getArgOperandNo(U)))
+        return true; // c) Passed to a capturing function.
+    }
 
     // 3. Propagate through pointer-like instructions
     for (const Use &UserUse : User->uses())
       Uses.push_back(const_cast<Use *>(&UserUse));
   }
 
-  // Now, run the backward dataflow analysis for indirect escapes.
+  // II) Now, run the backward dataflow analysis for indirect escapes.
   // The worklist is seeded with pointers that store our allocation.
   unsigned Iter = 0;
   while (!Worklist.empty()) {
@@ -129,22 +128,23 @@ bool EscapeAnalysisInfo::solveEscapeFor(const Value &AllocationSite) {
     if (++Iter > WorklistLimit) {
       LLVM_DEBUG(dbgs() << "[EA] worklist limit exceeded (" << WorklistLimit
                         << ") for allocation site: " << AllocationSite << "\n");
-      // Too complex: conservatively assume it escapes.
-      return true;
+      return true; // Too complex: conservatively assume it escapes.
     }
 
     const Value *V = Worklist.pop_back_val();
+
     if (!V || !V->getType()->isPointerTy()) continue;
     if (isa<Constant>(V)) continue; // Constants can't be part of a def-use
                                     // chain we care about.
     if (!EscapedSet.insert(V).second) continue; // Already processed.
 
-    if (const auto *Arg = dyn_cast<Argument>(V))
+    if (isa<Argument>(V)) {
       // If an escaped value can be traced back to a function argument,
       // it means the allocation was stored in a location pointed to by
       // that argument. Since we can't know where that argument points,
       // we must conservatively assume it escapes.
       return true;
+    }
 
     if (const auto *I = dyn_cast<Instruction>(V))
       applyTransferFunction(I, Worklist, EscapedSet);
