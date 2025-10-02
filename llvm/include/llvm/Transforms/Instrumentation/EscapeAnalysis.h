@@ -49,8 +49,8 @@ struct EscapeAnalysisInfo {
                   FunctionAnalysisManager::Invalidator &Inv);
 
 private:
-  Function &F;
-  FunctionAnalysisManager &FAM;
+  /* TMP */ [[maybe_unused]] /* TMP */ Function &F;
+  /* TMP */ [[maybe_unused]] /* TMP */ FunctionAnalysisManager &FAM;
   DenseMap<const Value *, bool> Cache;
 
   /// Backward transfer for pointer-like instructions (GEP/cast/select,
@@ -76,7 +76,7 @@ public:
 /// Printer pass for the \c EscapeAnalysis results.
 class EscapeAnalysisPrinterPass
     : public PassInfoMixin<EscapeAnalysisPrinterPass> {
-  raw_ostream &OS;
+  /* TMP */ [[maybe_unused]] /* TMP */ raw_ostream &OS;
 
 public:
   explicit EscapeAnalysisPrinterPass(raw_ostream &OS) : OS(OS) {}

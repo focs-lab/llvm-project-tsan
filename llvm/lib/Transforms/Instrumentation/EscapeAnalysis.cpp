@@ -15,11 +15,15 @@
 #include "llvm/ADT/Statistic.h"
 #include "llvm/Analysis/AliasAnalysis.h"
 #include "llvm/Analysis/MemoryBuiltins.h"
+#include "llvm/Analysis/MemorySSA.h"
 #include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/TargetParser/ARMTargetParser.h"
+
+#include <deque>
 
 #define DEBUG_TYPE "escape-analysis"
 
@@ -74,83 +78,173 @@ void EscapeAnalysisInfo::applyTransferFunction(
   // For other instructions (e.g., binary operators), we stop propagation.
 }
 
-bool EscapeAnalysisInfo::solveEscapeFor(const Value &AllocationSite) {
-  // Find all initial escape points for the allocation.
-  // We use LLVM's built-in CaptureTracking as a powerful first-pass filter.
-  // It's fast but not flow-sensitive, so it might miss indirect escapes that
-  // our dataflow analysis will catch.
-  SmallVector<const Value *, 16> Worklist;
-  DenseSet<const Value *> EscapedSet;
+// Helper function to check if value is of supported type for Result set
+static bool isResultTypeValue(const Value *V) {
+  return isa<AllocaInst>(V) || isa<GlobalVariable>(V) || isa<GlobalAlias>(V) ||
+         isa<Argument>(V) || isa<ConstantPointerNull>(V) ||
+         isa<UndefValue>(V) || isa<PoisonValue>(V);
+}
 
-  SmallVector<Use *, 16> Uses;
-  for (const Use &U : AllocationSite.uses())
-    Uses.push_back(const_cast<Use*>(&U));
+static bool fastPathCollectUnderlying(const Value *Curr,
+                                      SmallPtrSetImpl<const Value *> &Result,
+                                      SmallVectorImpl<const Value *> &Work) {
+  SmallVector<const Value *, 4> Bases;
+  getUnderlyingObjects(Curr, Bases);
 
-  // I) Fast search for direct escapes by use-def chain and collect possible
-  // sources of indirect escapes.
-  while (!Uses.empty()) {
-    const Use *U = Uses.pop_back_val();
-    const auto *User = dyn_cast<Instruction>(U->getUser());
-    // Some users (e.g. ConstantExpr) are not Instructions; skip them safely.
-    if (!User)
-      continue;
-
-    // 1. Direct escape points
-    if (isa<ReturnInst>(User))
-      return true; // a) Return the address
-
-    if (const auto *SI = dyn_cast<StoreInst>(User);
-        SI && U->get() == SI->getValueOperand()) {
-      if (isa<GlobalVariable>(getUnderlyingObject(SI->getPointerOperand())))
-        return true; // b) Store to a global
-
-      // Add indirect uses to the worklist for dataflow analysis
-      // If the allocation is stored, the address where it's stored becomes
-      // a source of potential escapes.
-      Worklist.push_back(cast<StoreInst>(User)->getPointerOperand());
-    }
-
-    if (const CallBase *CB = dyn_cast<CallBase>(User)) {
-      if (CB->isArgOperand(U) && !CB->doesNotCapture(CB->getArgOperandNo(U)))
-        return true; // c) Passed to a capturing function.
-    }
-
-    // 3. Propagate through pointer-like instructions
-    for (const Use &UserUse : User->uses())
-      Uses.push_back(const_cast<Use *>(&UserUse));
+  if (Bases.empty() || (Bases.size() == 1 && Bases[0] == Curr)) {
+    Result.insert(Curr);
+    return false;
   }
 
-  // II) Now, run the backward dataflow analysis for indirect escapes.
-  // The worklist is seeded with pointers that store our allocation.
-  unsigned Iter = 0;
-  while (!Worklist.empty()) {
-    // Safety valve against pathological def-use graphs.
-    if (++Iter > WorklistLimit) {
-      LLVM_DEBUG(dbgs() << "[EA] worklist limit exceeded (" << WorklistLimit
-                        << ") for allocation site: " << AllocationSite << "\n");
-      return true; // Too complex: conservatively assume it escapes.
+  bool IsAllFinalTypes = true;
+  for (const Value *B : Bases) {
+    assert(B && "getUnderlyingObjects must return non-null pointers");
+    if (isResultTypeValue(B)) {
+      Result.insert(B);
+    } else if (B != Curr) {
+      Work.push_back(B);
+      IsAllFinalTypes = false;
     }
+  }
+  return IsAllFinalTypes;
+}
 
-    const Value *V = Worklist.pop_back_val();
+static bool handleMemoryInstr(const Instruction *I,
+                              SmallVectorImpl<const Value *> &Work) {
+  // If it's a store, follow the stored value.
+  if (const auto *SI = dyn_cast<StoreInst>(I)) {
+    if (SI->getValueOperand())
+      Work.push_back(SI->getValueOperand());
+    return true;
+  }
 
-    if (!V || !V->getType()->isPointerTy()) continue;
-    if (isa<Constant>(V)) continue; // Constants can't be part of a def-use
-                                    // chain we care about.
-    if (!EscapedSet.insert(V).second) continue; // Already processed.
+  // If it's a memcpy/memmove, use the src operand as source of data.
+  if (const auto *MTI = dyn_cast<MemTransferInst>(I)) {
+    Work.push_back(MTI->getSource());
+    return true;
+  }
 
-    if (isa<Argument>(V)) {
-      // If an escaped value can be traced back to a function argument,
-      // it means the allocation was stored in a location pointed to by
-      // that argument. Since we can't know where that argument points,
-      // we must conservatively assume it escapes.
-      return true;
-    }
-
-    if (const auto *I = dyn_cast<Instruction>(V))
-      applyTransferFunction(I, Worklist, EscapedSet);
+  // Memset writes repeated byte value; follow the value (often a constant).
+  if (const auto *MSI = dyn_cast<MemSetInst>(I)) {
+    if (const Value *V = MSI->getValue())
+      Work.push_back(V);
+    return true;
   }
 
   return false;
+}
+
+// Add incoming unvisited MemoryAccesses of a MemoryPhi to MAWorkList.
+static void
+appendUnvisitedIncomingMAs(const MemoryPhi *MP,
+                           SmallPtrSetImpl<const MemoryAccess *> &VisitedMA,
+                           SmallVectorImpl<const MemoryAccess *> &MAWorkList) {
+  for (const auto &U : MP->incoming_values()) {
+    const MemoryAccess *InMA = cast<MemoryAccess>(U);
+    if (VisitedMA.insert(InMA).second)
+      MAWorkList.push_back(InMA);
+  }
+}
+
+/*
+static void
+fallbackToGetUnderlyingObjects(const Value *Ptr,
+                               SmallPtrSetImpl<const Value *> &Result) {
+  SmallVector<const Value *, 4> PtrBases;
+  getUnderlyingObjects(Ptr, PtrBases);
+  for (const Value *Pb : PtrBases) {
+    if (isResultTypeValue(Pb))
+      Result.insert(Pb);
+    else
+      ;
+  }
+}
+*/
+
+/// Return the set of possible underlying objects (alloca/global/arg/const/...)
+/// for V. Uses llvm::getUnderlyingObjects for cheap cases and MemorySSA for
+/// following stores through loads.
+SmallPtrSet<const Value *, 16>
+getUnderlyingObjectsThroughLoads(const Value *V, MemorySSA *MSSA) {
+  SmallPtrSet<const Value *, 16> Result;
+  SmallPtrSet<const Value *, 32> VisitedValues;
+  SmallPtrSet<const MemoryAccess *, 32> VisitedMA;
+
+  SmallVector<const Value *, 32> Work;
+  Work.push_back(V);
+
+  assert(MSSA && "MemorySSA is required for this analysis");
+  MemorySSAWalker *Walker = MSSA->getWalker();
+
+  while (!Work.empty()) {
+    const Value *CurrVal = Work.pop_back_val();
+    if (!VisitedValues.insert(CurrVal).second)
+      continue;
+
+    // Fast-path: try ValueTracking to strip casts/geps and get candidate bases.
+    if (fastPathCollectUnderlying(CurrVal, Result, Work))
+      continue;
+
+    // If CurrVal is a LoadInst, use MemorySSA to find the clobbering access
+    if (const auto *LI = dyn_cast<LoadInst>(CurrVal)) {
+      MemoryAccess *MA = MSSA->getMemoryAccess(LI);
+      if (!MA) {
+        Result.insert(LI);
+        continue;
+      }
+
+      // Use MemorySSA's API to get the clobbering MemoryAccess.
+      const MemoryAccess *Clobber = Walker->getClobberingMemoryAccess(MA);
+      assert(Clobber &&
+             "getClobberingMemoryAccess must return valid MemoryAccess");
+
+      SmallVector<const MemoryAccess *, 32> MAWorkList;
+      if (VisitedMA.insert(Clobber).second)
+        MAWorkList.push_back(Clobber);
+
+      while (!MAWorkList.empty()) {
+        const MemoryAccess *CurrClobber = MAWorkList.pop_back_val();
+
+        if (MSSA->isLiveOnEntryDef(CurrClobber))
+          continue; // We are done
+
+        if (const MemoryDef *MD = dyn_cast<MemoryDef>(CurrClobber)) {
+          // If clobber is a MemoryDef, inspect its instruction.
+          const Instruction *MI = MD->getMemoryInst();
+          assert(MI && "MemoryDef must have an instruction");
+
+          if (handleMemoryInstr(MI, Work))
+            continue;
+
+          // If it's a Call/Invoke (CallBase), try to be smarter via attributes.
+          if (const auto *CB = dyn_cast<CallBase>(MI)) {
+            // If the call only reads/doesn't access memory, it can't be a
+            // defining write -> ignore.
+            if (!(CB->onlyReadsMemory() || CB->doesNotAccessMemory()))
+              Result.insert(CB); // Cannot do anymore with the Call
+            continue;
+          }
+          // If the clobber instruction wasn't handled specially, push it for
+          // normal analysis (will be processed with fastPath or inserted).
+          Work.push_back(MI);
+        } else if (const auto *MP = dyn_cast<MemoryPhi>(CurrClobber)) {
+          // Iterate the incoming accesses and process each incoming MemoryAccess.
+          appendUnvisitedIncomingMAs(MP, VisitedMA, MAWorkList);
+        } else {
+          llvm_unreachable("getClobberingMemoryAccess must return either "
+                           "MemoryDef or MemoryPhi");
+        }
+      } // end while for MAWorkList
+    } else {
+      // Non-load instruction, we've already tried fastPath; just insert it as is
+      Result.insert(CurrVal);
+    }
+  } // end while for Work
+  return Result;
+}
+
+bool EscapeAnalysisInfo::solveEscapeFor(const Value &AllocationSite) {
+  return true;
 }
 
 bool EscapeAnalysisInfo::isEscaping(const Value &Alloc) {
