@@ -19,6 +19,7 @@
 #include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/InstIterator.h"
+#include "llvm/IR/IntrinsicInst.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/TargetParser/ARMTargetParser.h"
@@ -78,169 +79,285 @@ void EscapeAnalysisInfo::applyTransferFunction(
   // For other instructions (e.g., binary operators), we stop propagation.
 }
 
+/*
 // Helper function to check if value is of supported type for Result set
 static bool isResultTypeValue(const Value *V) {
   return isa<AllocaInst>(V) || isa<GlobalVariable>(V) || isa<GlobalAlias>(V) ||
          isa<Argument>(V) || isa<ConstantPointerNull>(V) ||
          isa<UndefValue>(V) || isa<PoisonValue>(V);
 }
+*/
 
-static bool fastPathCollectUnderlying(const Value *Curr,
-                                      SmallPtrSetImpl<const Value *> &Result,
-                                      SmallVectorImpl<const Value *> &Work) {
-  SmallVector<const Value *, 4> Bases;
-  getUnderlyingObjects(Curr, Bases);
-
-  if (Bases.empty() || (Bases.size() == 1 && Bases[0] == Curr)) {
-    Result.insert(Curr);
-    return false;
-  }
-
-  bool IsAllFinalTypes = true;
-  for (const Value *B : Bases) {
-    assert(B && "getUnderlyingObjects must return non-null pointers");
-    if (isResultTypeValue(B)) {
-      Result.insert(B);
-    } else if (B != Curr) {
-      Work.push_back(B);
-      IsAllFinalTypes = false;
-    }
-  }
-  return IsAllFinalTypes;
-}
-
-static bool handleMemoryInstr(const Instruction *I,
-                              SmallVectorImpl<const Value *> &Work) {
+/*
+static bool handleStore(const Instruction *I,
+                        SmallVectorImpl<const Value *> &Work) {
   // If it's a store, follow the stored value.
   if (const auto *SI = dyn_cast<StoreInst>(I)) {
-    if (SI->getValueOperand())
+    if (SI->getValueOperand()) // maybe insert SI itself??
       Work.push_back(SI->getValueOperand());
     return true;
   }
-
-  // If it's a memcpy/memmove, use the src operand as source of data.
-  if (const auto *MTI = dyn_cast<MemTransferInst>(I)) {
-    Work.push_back(MTI->getSource());
-    return true;
-  }
-
-  // Memset writes repeated byte value; follow the value (often a constant).
-  if (const auto *MSI = dyn_cast<MemSetInst>(I)) {
-    if (const Value *V = MSI->getValue())
-      Work.push_back(V);
-    return true;
-  }
-
   return false;
+}
+
+static bool handleCall(SmallPtrSetImpl<const Value *> &Result,
+                       const Instruction *ClobberI) {
+  // If it's a Call/Invoke (CallBase), try to be smarter via attributes.
+  if (const auto *CB = dyn_cast<CallBase>(ClobberI)) {
+    // If the call only reads/doesn't access memory, it can't be a
+    // defining write -> ignore.
+    if (!(CB->onlyReadsMemory() || CB->doesNotAccessMemory())) {
+      Result.insert(CB); // Cannot do anymore with the Call
+      return true;
+    }
+  }
+  return false;
+}
+*/
+
+template <typename PtrT, typename SetT, typename WorklistT>
+static bool tryEnqueueIfNew(PtrT *P, SetT &Seen, WorklistT &WL) {
+  if (P && Seen.insert(P).second) {
+    WL.push_back(P);
+    return true;
+  }
+  return false;
+}
+
+static bool tryValueTracking(const Value *Curr, LoopInfo *LI,
+                             SmallVectorImpl<const Value *> &Work,
+                             SmallPtrSetImpl<const Value *> &Enqueued) {
+  SmallVector<const Value *, 4> Bases;
+  if (!Curr->getType()->isPointerTy())
+    return false; // Only pointers have underlying objects.
+
+  // getUnderlyingObjects(..., MaxLookup = 0) is assumed to mean "unbounded".
+  // If upstream changes semantics, this must be revisited.
+  getUnderlyingObjects(Curr, Bases, LI, /*MaxLookup=*/ 0);
+
+  if (Bases.empty() || (Bases.size() == 1 && Bases[0] == Curr))
+    return false;
+
+  for (const Value *B : Bases)
+    tryEnqueueIfNew(B, Enqueued, Work);
+  return true;
 }
 
 // Add incoming unvisited MemoryAccesses of a MemoryPhi to MAWorkList.
 static void
 appendUnvisitedIncomingMAs(const MemoryPhi *MP,
-                           SmallPtrSetImpl<const MemoryAccess *> &VisitedMA,
-                           SmallVectorImpl<const MemoryAccess *> &MAWorkList) {
-  for (const auto &U : MP->incoming_values()) {
-    const MemoryAccess *InMA = cast<MemoryAccess>(U);
-    if (VisitedMA.insert(InMA).second)
-      MAWorkList.push_back(InMA);
+                           SmallPtrSetImpl<MemoryAccess *> &VisitedMA,
+                           SmallVectorImpl<MemoryAccess *> &MAWorkList) {
+  for (unsigned i = 0, N = MP->getNumIncomingValues(); i != N; ++i) {
+    MemoryAccess *InMA = MP->getIncomingValue(i);
+    tryEnqueueIfNew(InMA, VisitedMA, MAWorkList);
   }
 }
 
-/*
-static void
-fallbackToGetUnderlyingObjects(const Value *Ptr,
-                               SmallPtrSetImpl<const Value *> &Result) {
-  SmallVector<const Value *, 4> PtrBases;
-  getUnderlyingObjects(Ptr, PtrBases);
-  for (const Value *Pb : PtrBases) {
-    if (isResultTypeValue(Pb))
-      Result.insert(Pb);
-    else
-      ;
-  }
-}
-*/
-
-/// Return the set of possible underlying objects (alloca/global/arg/const/...)
-/// for V. Uses llvm::getUnderlyingObjects for cheap cases and MemorySSA for
-/// following stores through loads.
-SmallPtrSet<const Value *, 16>
-getUnderlyingObjectsThroughLoads(const Value *V, MemorySSA *MSSA) {
-  SmallPtrSet<const Value *, 16> Result;
-  SmallPtrSet<const Value *, 32> VisitedValues;
-  SmallPtrSet<const MemoryAccess *, 32> VisitedMA;
-
+///===- GetUnderlyingObjectsThroughLoads ---------------------------------===//
+///
+/// A stronger variant of `llvm::getUnderlyingObjects` that uses MemorySSA
+/// to chase defining writes and, when possible, look through loads. This is
+/// more precise (and potentially more expensive) than plain ValueTracking.
+///
+/// \param V        A pointer-typed value to analyze.
+/// \param MSSA     A valid, up-to-date MemorySSA for the parent function of V.
+///                 Must not be null.
+/// \param Result   Output set that will be populated with the results. The set
+///                 is not cleared; new elements are inserted into it.
+/// \param LI       Optional LoopInfo used to improve reasoning about PHIs in
+///                 loops in ValueTracking.
+///
+/// \post
+///  - `Result` is augmented with zero or more pointer-typed "terminal sources"
+///    for `V`.
+///  - A "terminal source" is a pointer value where this analysis intentionally
+///    stops. Typical terminals include:
+///      * `AllocaInst`, `GlobalVariable`, `Argument`, `ConstantPointerNull`.
+///      * An SSA pointer value such as a `LoadInst` (or `PHINode`/`Select`
+///        as returned by ValueTracking) when MemorySSA cannot prove a precise
+///        defining write for the loaded bytes (e.g., memory is liveOnEntry,
+///        written by an opaque call, clobbered by memset/atomics/volatile,
+///        etc.).
+///      * A call result if ValueTracking stops at a call that returns a pointer
+///        (i.e., the usual terminals that `getUnderlyingObjects` would
+///        produce).
+///
+/// \note
+///  - If the analysis cannot find any sound terminal sources (e.g., due to a
+///    cycle or lack of proof), it is permitted to insert nothing. However, to
+///    match the spirit of `getUnderlyingObjects` and to keep clients
+///    predictable, when the walk stops at a pointer-typed SSA value (e.g., a
+///    `LoadInst`), this API is encouraged to insert that SSA value to represent
+///    an "unknown terminal".
+///  - The result is a may-set: `Result` contains all terminal candidates the
+///    analysis can conservatively identify, not a single precise source.
+///
+void getUnderlyingObjectsThroughLoads(const Value *V, MemorySSA *MSSA,
+                                      SmallPtrSetImpl<const Value *> &Result,
+                                      LoopInfo *LI,
+                                      bool *IsComplete = nullptr,
+                                      unsigned MaxSteps = 10000) {
+  SmallPtrSet<const Value *, 32> VisitedWithVT; // 1st stage (ValueTracking)
+  SmallPtrSet<const Value *, 32> Enqueued;      // Guard for enqueue (seen)
+  SmallPtrSet<MemoryAccess *, 32> VisitedMA;
   SmallVector<const Value *, 32> Work;
-  Work.push_back(V);
+
+  if (!V->getType()->isPointerTy())
+    return; // Only pointers have underlying objects.
+
+  auto markTerminal = [&](const Value *Term,
+                          bool ForceIncompleteIfNotBase = true) {
+    if (!Term || !Term->getType()->isPointerTy())
+      return;
+
+    const bool IsBase = isa<AllocaInst>(Term) || isa<GlobalVariable>(Term) ||
+                        isa<GlobalAlias>(Term) || isa<Argument>(Term) ||
+                        isa<ConstantPointerNull>(Term) ||
+                        isa<UndefValue>(Term) || isa<PoisonValue>(Term);
+
+    Result.insert(Term);
+    if (IsComplete && !IsBase && ForceIncompleteIfNotBase)
+      *IsComplete = false;
+  };
+
+  tryEnqueueIfNew(V, Enqueued, Work);
 
   assert(MSSA && "MemorySSA is required for this analysis");
   MemorySSAWalker *Walker = MSSA->getWalker();
 
+  unsigned StepCount = 0;
+  if (IsComplete)
+    *IsComplete = true;
+
   while (!Work.empty()) {
-    const Value *CurrVal = Work.pop_back_val();
-    if (!VisitedValues.insert(CurrVal).second)
+    const Value *CurrV = Work.pop_back_val();
+
+    // Safety valve: if we exceed MaxSteps, bail out conservatively.
+    if (++StepCount > MaxSteps) {
+      markTerminal(CurrV);
+      goto Bailout;
+    }
+
+    // Try ValueTracking first (only once per value)
+    if (VisitedWithVT.insert(CurrV).second) {
+      if (tryValueTracking(CurrV, LI, Work, Enqueued))
+        continue; // Successfully expanded via ValueTracking;
+    }
+
+    if (CurrV->getType()->getPointerAddressSpace() != 0) {
+      markTerminal(CurrV);
+      continue;
+    }
+
+    const auto *Load = dyn_cast<LoadInst>(CurrV);
+    if (!Load || Load->isVolatile() || Load->isAtomic()) {
+      markTerminal(CurrV);
+      continue;
+    }
+
+    MemoryAccess *MA = MSSA->getMemoryAccess(Load);
+    if (!MA) {
+      // If the instruction is not a memory access, we cannot go further.
+      markTerminal(Load);
+      continue;
+    }
+
+    // Use MemorySSA's API to get the clobbering MemoryAccess.
+    MemoryAccess *FirstClobber = Walker->getClobberingMemoryAccess(MA);
+    if (!FirstClobber) {
+      markTerminal(Load);
+      continue;
+    }
+
+    SmallVector<MemoryAccess *, 32> MAWorkList;
+    if (!tryEnqueueIfNew(FirstClobber, VisitedMA, MAWorkList))
       continue;
 
-    // Fast-path: try ValueTracking to strip casts/geps and get candidate bases.
-    if (fastPathCollectUnderlying(CurrVal, Result, Work))
-      continue;
+    // Local accumulators for Load
+    SmallPtrSet<const Value *, 8> LocalResult; // Terminals found for Load
+    SmallVector<const Value *, 8> LocalWork;
+    SmallPtrSet<const Value *, 8> LocalEnqueued;
+    LocalEnqueued.insert(Load);
+    bool Fallback = false;
+    unsigned MAIterations = 0;
+    const unsigned MAIterationLimit = MaxSteps / 2;
 
-    // If CurrVal is a LoadInst, use MemorySSA to find the clobbering access
-    if (const auto *LI = dyn_cast<LoadInst>(CurrVal)) {
-      MemoryAccess *MA = MSSA->getMemoryAccess(LI);
-      if (!MA) {
-        Result.insert(LI);
-        continue;
+    while (!MAWorkList.empty()) {
+      if (++MAIterations > MAIterationLimit) {
+        Fallback = true;
+        break;
+      }
+      MemoryAccess *CurrClobber = MAWorkList.pop_back_val();
+
+      // If the defining access is live-on-entry, we conservatively treat the
+      // load itself as a terminal (unknown source).
+      if (MSSA->isLiveOnEntryDef(CurrClobber)) {
+        LocalResult.insert(Load);
+        continue; // We are done
       }
 
-      // Use MemorySSA's API to get the clobbering MemoryAccess.
-      const MemoryAccess *Clobber = Walker->getClobberingMemoryAccess(MA);
-      assert(Clobber &&
-             "getClobberingMemoryAccess must return valid MemoryAccess");
+      if (auto *MD = dyn_cast<MemoryDef>(CurrClobber)) {
+        // If clobber is a MemoryDef, inspect its instruction.
+        const Instruction *ClobberI = MD->getMemoryInst();
+        assert(ClobberI && "MemoryDef must have an instruction");
 
-      SmallVector<const MemoryAccess *, 32> MAWorkList;
-      if (VisitedMA.insert(Clobber).second)
-        MAWorkList.push_back(Clobber);
-
-      while (!MAWorkList.empty()) {
-        const MemoryAccess *CurrClobber = MAWorkList.pop_back_val();
-
-        if (MSSA->isLiveOnEntryDef(CurrClobber))
-          continue; // We are done
-
-        if (const MemoryDef *MD = dyn_cast<MemoryDef>(CurrClobber)) {
-          // If clobber is a MemoryDef, inspect its instruction.
-          const Instruction *MI = MD->getMemoryInst();
-          assert(MI && "MemoryDef must have an instruction");
-
-          if (handleMemoryInstr(MI, Work))
-            continue;
-
-          // If it's a Call/Invoke (CallBase), try to be smarter via attributes.
-          if (const auto *CB = dyn_cast<CallBase>(MI)) {
-            // If the call only reads/doesn't access memory, it can't be a
-            // defining write -> ignore.
-            if (!(CB->onlyReadsMemory() || CB->doesNotAccessMemory()))
-              Result.insert(CB); // Cannot do anymore with the Call
+        // Stores: chase the stored pointer when safe; otherwise, conservatively stop.
+        if (const auto *Store = dyn_cast<StoreInst>(ClobberI)) {
+          // Volatile or atomic stores are opaque.
+          if (Store->isVolatile() || Store->isAtomic()) {
+            Fallback = true;
+            break;
+          }
+          const Value *SV = Store->getValueOperand();
+          if (SV->getType()->isPointerTy()) {
+            tryEnqueueIfNew(SV, LocalEnqueued, LocalWork);
             continue;
           }
-          // If the clobber instruction wasn't handled specially, push it for
-          // normal analysis (will be processed with fastPath or inserted).
-          Work.push_back(MI);
-        } else if (const auto *MP = dyn_cast<MemoryPhi>(CurrClobber)) {
-          // Iterate the incoming accesses and process each incoming MemoryAccess.
-          appendUnvisitedIncomingMAs(MP, VisitedMA, MAWorkList);
-        } else {
-          llvm_unreachable("getClobberingMemoryAccess must return either "
-                           "MemoryDef or MemoryPhi");
+          // We intentionally doesn't treat memset/memcpy/memset as terminals.
+          Fallback = true;
+          break;
         }
-      } // end while for MAWorkList
+        // Fallback: unrecognized defining write, stop here conservatively.
+        Fallback = true;
+      } else if (const auto *MP = dyn_cast<MemoryPhi>(CurrClobber)) {
+        // Iterate the incoming accesses and process each incoming
+        // MemoryAccess.
+        appendUnvisitedIncomingMAs(MP, VisitedMA, MAWorkList);
+      } else if (auto *MU = dyn_cast<MemoryUse>(CurrClobber)) {
+        // If clobber is a MemoryUse (rarely but possible), get its defining.
+        MemoryAccess *Def = Walker->getClobberingMemoryAccess(MU);
+        tryEnqueueIfNew(Def, VisitedMA, MAWorkList);
+      } else {
+#ifndef NDEBUG
+        llvm_unreachable("Unexpected MemoryAccess kind");
+#else
+        // In release builds be conservative and fallback to sound result.
+        Fallback = true;
+        break;
+#endif
+      }
+    } // end while for MAWorkList
+
+    if (Fallback) {
+      markTerminal(Load);
     } else {
-      // Non-load instruction, we've already tried fastPath; just insert it as is
-      Result.insert(CurrVal);
+      // Merge LocalResult and LocalWork into global sets
+      for (const auto *T : LocalResult)
+        if (T && T->getType()->isPointerTy())
+          Result.insert(T);
+      for (const auto *WV : LocalWork)
+        tryEnqueueIfNew(WV, Enqueued, Work);
     }
   } // end while for Work
-  return Result;
+  return;
+
+Bailout:
+  LLVM_DEBUG(dbgs() << "getUnderlyingObjectsThroughLoads: MaxSteps exceeded\n");
+  // Conservative: mark all remaining items as terminals
+  for (const Value *WV : Work)
+    if (WV && WV->getType()->isPointerTy())
+      Result.insert(WV);
 }
 
 bool EscapeAnalysisInfo::solveEscapeFor(const Value &AllocationSite) {
