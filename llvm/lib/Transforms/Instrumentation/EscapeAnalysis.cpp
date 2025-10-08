@@ -213,8 +213,7 @@ void getUnderlyingObjectsThroughLoads(const Value *V, MemorySSA *MSSA,
 
     const bool IsBase = isa<AllocaInst>(Term) || isa<GlobalVariable>(Term) ||
                         isa<GlobalAlias>(Term) || isa<Argument>(Term) ||
-                        isa<ConstantPointerNull>(Term) ||
-                        isa<UndefValue>(Term) || isa<PoisonValue>(Term);
+                        isa<ConstantPointerNull>(Term);
 
     Result.insert(Term);
     if (IsComplete && !IsBase && ForceIncompleteIfNotBase)
@@ -243,11 +242,6 @@ void getUnderlyingObjectsThroughLoads(const Value *V, MemorySSA *MSSA,
     if (VisitedWithVT.insert(CurrV).second) {
       if (tryValueTracking(CurrV, LI, Work, Enqueued))
         continue; // Successfully expanded via ValueTracking;
-    }
-
-    if (CurrV->getType()->getPointerAddressSpace() != 0) {
-      markTerminal(CurrV);
-      continue;
     }
 
     const auto *Load = dyn_cast<LoadInst>(CurrV);
@@ -314,19 +308,29 @@ void getUnderlyingObjectsThroughLoads(const Value *V, MemorySSA *MSSA,
             tryEnqueueIfNew(SV, LocalEnqueued, LocalWork);
             continue;
           }
-          // We intentionally doesn't treat memset/memcpy/memset as terminals.
-          Fallback = true;
-          break;
+          // Non-pointer store into memory from which we later load a pointer:
+          // treat as unknown/opaque write.
         }
+        // NOTE: We intentionally don't consider the source in memintrinsics
+        // such as memset/memcpy/memset as underlying objects, because it's
+        // wrong semantics.
+
         // Fallback: unrecognized defining write, stop here conservatively.
         Fallback = true;
-      } else if (const auto *MP = dyn_cast<MemoryPhi>(CurrClobber)) {
+        break;
+      }
+
+      if (const auto *MP = dyn_cast<MemoryPhi>(CurrClobber)) {
         // Iterate the incoming accesses and process each incoming
         // MemoryAccess.
         appendUnvisitedIncomingMAs(MP, VisitedMA, MAWorkList);
       } else if (auto *MU = dyn_cast<MemoryUse>(CurrClobber)) {
         // If clobber is a MemoryUse (rarely but possible), get its defining.
         MemoryAccess *Def = Walker->getClobberingMemoryAccess(MU);
+        if (!Def) {
+          Fallback = true;
+          break;
+        }
         tryEnqueueIfNew(Def, VisitedMA, MAWorkList);
       } else {
 #ifndef NDEBUG
@@ -344,8 +348,7 @@ void getUnderlyingObjectsThroughLoads(const Value *V, MemorySSA *MSSA,
     } else {
       // Merge LocalResult and LocalWork into global sets
       for (const auto *T : LocalResult)
-        if (T && T->getType()->isPointerTy())
-          Result.insert(T);
+        markTerminal(T);
       for (const auto *WV : LocalWork)
         tryEnqueueIfNew(WV, Enqueued, Work);
     }
