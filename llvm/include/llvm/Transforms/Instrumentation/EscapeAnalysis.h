@@ -19,6 +19,7 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/Analysis/CaptureTracking.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/MemorySSA.h"
 #include "llvm/IR/PassManager.h"
@@ -54,12 +55,34 @@ private:
   MemorySSA *MSSA = nullptr;
   LoopInfo *LI = nullptr;
 
+  /// Custom CaptureTracker for escape analysis
+  class EscapeCaptureTracker : public CaptureTracker {
+  public:
+    EscapeCaptureTracker(EscapeAnalysisInfo &EAI,
+                         const SmallPtrSet<const Value *, 32> &ProcessingSet)
+        : EAI(EAI), ProcessingSet(ProcessingSet) {}
+
+    void tooManyUses() override { Escaped = true; }
+    bool shouldExplore(const Use *U) override;
+    Action captured(const Use *U, UseCaptureInfo CI) override;
+    bool hasEscaped() const { return Escaped; }
+
+  private:
+    EscapeAnalysisInfo &EAI;
+    SmallPtrSet<const Value *, 32> ProcessingSet;
+    bool Escaped = false;
+
+    /// Analyze if storing to destination causes escape
+    bool doesStoreDestinationEscape(const StoreInst *SI);
+  };
+
   bool analyzeStoreDestEscapes(SmallVector<const Value *, 32> Worklist,
                                SmallPtrSet<const Value *, 32> Visited,
                                const Value *Dest);
 
   /// Solve escape for a single allocation site using backward dataflow.
-  bool solveEscapeFor(const Value &Allocation);
+  bool solveEscapeFor(const Value &Allocation,
+                      SmallPtrSet<const Value *, 32> &ProcessingSet);
 };
 
 /// EscapeAnalysisInfo wrapper for the new pass manager.

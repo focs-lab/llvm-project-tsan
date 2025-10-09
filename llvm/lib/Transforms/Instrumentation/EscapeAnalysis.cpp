@@ -42,7 +42,7 @@ WorklistLimit("escape-analysis-worklist-limit", cl::init(10000), cl::Hidden,
                        "if exceeded, assume the allocation escapes"));
 
 //===----------------------------------------------------------------------===//
-// EscapeAnalysis Implementation
+// getUnderlyingObjectsThroughLoads Implementation
 //===----------------------------------------------------------------------===//
 
 template <typename PtrT, typename SetT, typename WorklistT>
@@ -293,6 +293,163 @@ Bailout:
       Result.insert(WV);
 }
 
+//===----------------------------------------------------------------------===//
+// EscapeCaptureTracker Implementation
+//===----------------------------------------------------------------------===//
+
+bool EscapeAnalysisInfo::EscapeCaptureTracker::shouldExplore(const Use *U) {
+  // Always explore, but we can add optimizations here later
+  return true;
+}
+
+bool EscapeAnalysisInfo::EscapeCaptureTracker::doesStoreDestinationEscape(
+    const StoreInst *SI) {
+  const Value *Dest = SI->getPointerOperand();
+
+  // Find base objects for the storage location using our enhanced analysis
+  SmallPtrSet<const Value *, 8> BaseObjects;
+  bool IsComplete = false;
+  getUnderlyingObjectsThroughLoads(Dest, EAI.MSSA, BaseObjects, EAI.LI,
+                                   &IsComplete);
+
+  if (BaseObjects.empty() || !IsComplete) {
+    LLVM_DEBUG(dbgs() << "  Store destination unknown, escapes\n");
+    return true;
+  }
+
+  // Check each base object
+  for (const Value *Base : BaseObjects) {
+    // Global variable - object escapes
+    if (isa<GlobalVariable>(Base) || isa<GlobalAlias>(Base)) {
+      LLVM_DEBUG(dbgs() << "  Stored to global variable, escapes\n");
+      return true;
+    }
+
+    // Function argument - object may escape (unless nocapture)
+    if (const auto *Arg = dyn_cast<Argument>(Base)) {
+      if (!Arg->hasNoCaptureAttr()) {
+        LLVM_DEBUG(dbgs() << "  Stored to non-nocapture argument, escapes\n");
+        return true;
+      }
+      continue;
+    }
+
+    // If storing to another local allocation, recursively check if it escapes
+    if (const auto *AI = dyn_cast<AllocaInst>(Base)) {
+      // Prevent infinite recursion by checking if we're already processing this alloca
+      if (ProcessingSet.count(AI)) {
+        // Cyclic dependency - conservatively assume escape
+        LLVM_DEBUG(dbgs() << "  Cyclic store dependency, escapes\n");
+        return true;
+      }
+
+      // Check cache first
+      if (auto CacheIt = EAI.Cache.find(AI); CacheIt != EAI.Cache.end()) {
+        if (CacheIt->second) {
+          LLVM_DEBUG(dbgs() << "  Stored to escaping alloca (cached), escapes\n");
+          return true;
+        }
+        continue;
+      }
+
+      // Recursively analyze this allocation
+      SmallPtrSet<const Value *, 32> RecursiveProcessingSet;
+      RecursiveProcessingSet.insert(AI);
+
+      if (EAI.solveEscapeFor(*AI, RecursiveProcessingSet)) {
+        LLVM_DEBUG(dbgs() << "  Stored to escaping alloca, escapes\n");
+        return true;
+      }
+      continue;
+    }
+    // Unknown base object (e.g., LoadInst, Call result)
+    // Conservatively assume the object escapes
+    LLVM_DEBUG(dbgs() << "  Stored to unknown location: " << *Base
+                      << ", escapes\n");
+    return true;
+  }
+  return false;
+}
+
+CaptureTracker::Action
+EscapeAnalysisInfo::EscapeCaptureTracker::captured(const Use *U,
+                                                    UseCaptureInfo CI) {
+  Instruction *I = cast<Instruction>(U->getUser());
+
+  // First, use the standard CaptureTracking analysis to filter obvious cases
+  // CI contains UseCC (direct capture) and ResultCC (capture through return)
+
+  // Handle return instructions specially for escape analysis
+  if (isa<ReturnInst>(I)) {
+    // Returning the pointer means it escapes the function
+    LLVM_DEBUG(dbgs() << "  Returned from function, escapes\n");
+    Escaped = true;
+    return Stop;
+  }
+
+  // If CaptureTracking says it's not captured at all, we can continue
+  if (capturesNothing(CI.UseCC)) {
+    // But check if it's passed through (e.g., GEP, bitcast, phi, select)
+    if (CI.isPassthrough()) {
+      // Continue analyzing the result of this operation
+      return Continue;
+    }
+    // Otherwise, this use doesn't cause escape
+    return ContinueIgnoringReturn;
+  }
+
+  // Now handle special cases where CaptureTracking says it's captured,
+  // but we need more sophisticated escape analysis
+
+  // Special handling for Store instructions
+  if (const auto *SI = dyn_cast<StoreInst>(I)) {
+    // Check if we're storing the pointer (not storing to it)
+    if (SI->getValueOperand() == U->get()) {
+      // Use our enhanced MemorySSA-based analysis to check if the
+      // destination itself escapes
+      if (doesStoreDestinationEscape(SI)) {
+        LLVM_DEBUG(dbgs() << "  Store to escaping destination, escapes\n");
+        Escaped = true;
+        return Stop;
+      }
+      // Store to local non-escaping location - doesn't cause escape
+      return ContinueIgnoringReturn;
+    }
+  }
+
+  // Special handling for Call/Invoke with nocapture arguments
+  // if (const auto *CB = dyn_cast<CallBase>(I)) {
+  //   if (!CB->isCallee(U)) {
+  //     // Check if the argument is marked nocapture
+  //     for (unsigned ArgNo = 0; ArgNo < CB->arg_size(); ++ArgNo) {
+  //       if (CB->getArgOperand(ArgNo) == U->get()) {
+  //         if (CB->getCalledFunction()->hasParamAttribute(
+  //                 ArgNo, Attribute::AttrKind::NoCapture)) {
+  //           // Argument is nocapture - doesn't escape
+  //           LLVM_DEBUG(dbgs() << "  Passed to nocapture parameter\n");
+  //           return ContinueIgnoringReturn;
+  //         }
+  //         break;
+  //       }
+  //     }
+  //   }
+  // }
+
+  // For all other captures reported by CaptureTracking, we trust its judgment
+  if (capturesAnything(CI.UseCC)) {
+    LLVM_DEBUG(dbgs() << "  Captured by: " << *I << "\n");
+    Escaped = true;
+    return Stop;
+  }
+
+  // If ResultCC indicates the result may capture the pointer, continue
+  // analyzing the result
+  if (capturesAnything(CI.ResultCC))
+    return Continue;
+
+  return ContinueIgnoringReturn;
+}
+
 bool EscapeAnalysisInfo::analyzeStoreDestEscapes(
     SmallVector<const Value *, 32> Worklist,
     SmallPtrSet<const Value *, 32> Visited, const Value *Dest) {
@@ -348,6 +505,61 @@ bool EscapeAnalysisInfo::analyzeStoreDestEscapes(
   return false;
 }
 
+//===----------------------------------------------------------------------===//
+// EscapeAnalysis Core Implementation
+//===----------------------------------------------------------------------===//
+
+bool EscapeAnalysisInfo::solveEscapeFor(
+    const Value &Allocation,
+    SmallPtrSet<const Value *, 32> &ProcessingSet) {
+  // Mark this allocation as being processed to prevent infinite recursion
+  ProcessingSet.insert(&Allocation);
+
+  // Create our custom tracker
+  EscapeCaptureTracker Tracker(*this, ProcessingSet);
+
+  // Use the CaptureTracking infrastructure to analyze the allocation
+  // We set ReturnCaptures=true because returning a pointer means it escapes
+  PointerMayBeCaptured(&Allocation, &Tracker,
+                       /*MaxUsesToExplore=*/WorklistLimit);
+
+  return Tracker.hasEscaped();
+}
+
+bool EscapeAnalysisInfo::isEscaping(const Value &Alloc) {
+  // 1. Get the underlying object
+  const Value *UnderlyingObj = getUnderlyingObjectAggressive(&Alloc);
+
+  // 2. Check the cache for a previously computed result
+  if (const auto CacheIt = Cache.find(UnderlyingObj); CacheIt != Cache.end())
+    return CacheIt->second;
+
+  // 3. If not in cache, run the analysis
+  LLVM_DEBUG(dbgs() << "EscapeAnalysis: Analyzing " << *UnderlyingObj << "\n");
+  NumAllocationsAnalyzed++;
+
+  // Lazily get other analyses from the FAM
+  if (!MSSA)
+    MSSA = &FAM.getResult<MemorySSAAnalysis>(F).getMSSA();
+  if (!LI)
+    LI = &FAM.getResult<LoopAnalysis>(F);
+
+  // Track allocations being processed to detect cycles
+  SmallPtrSet<const Value *, 32> ProcessingSet;
+  const bool Result = solveEscapeFor(*UnderlyingObj, ProcessingSet);
+
+  if (Result) {
+    NumAllocationsEscaped++;
+    LLVM_DEBUG(dbgs() << "  -> Result: ESCAPES\n");
+  } else {
+    LLVM_DEBUG(dbgs() << "  -> Result: DOES NOT ESCAPE\n");
+  }
+
+  // 4. Store result in cache and return
+  return Cache[UnderlyingObj] = Result;
+}
+
+/*
 bool EscapeAnalysisInfo::solveEscapeFor(const Value &AllocationSite) {
   SmallVector<const Value *, 32> Worklist;
   SmallPtrSet<const Value *, 32> Visited;
@@ -584,6 +796,7 @@ bool EscapeAnalysisInfo::isEscaping(const Value &Alloc) {
   // 4. Store result in cache and return.
   return Cache[UnderlyingObj] = Result;
 }
+*/
 
 bool EscapeAnalysisInfo::invalidate(Function &F, const PreservedAnalyses &PA,
                                     FunctionAnalysisManager::Invalidator &Inv) {
