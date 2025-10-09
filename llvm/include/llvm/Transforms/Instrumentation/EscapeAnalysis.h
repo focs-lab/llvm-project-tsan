@@ -19,11 +19,9 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
-#include "llvm/IR/Function.h"
-#include "llvm/IR/Instructions.h"
+#include "llvm/Analysis/LoopInfo.h"
+#include "llvm/Analysis/MemorySSA.h"
 #include "llvm/IR/PassManager.h"
-
-#include <memory>
 
 namespace llvm {
 
@@ -49,15 +47,16 @@ struct EscapeAnalysisInfo {
                   FunctionAnalysisManager::Invalidator &Inv);
 
 private:
-  /* TMP */ [[maybe_unused]] /* TMP */ Function &F;
-  /* TMP */ [[maybe_unused]] /* TMP */ FunctionAnalysisManager &FAM;
+  Function &F;
+  FunctionAnalysisManager &FAM;
   DenseMap<const Value *, bool> Cache;
 
-  /// Backward transfer for pointer-like instructions (GEP/cast/select,
-  /// PHI, load) that propagate the "escaped" property to operands.
-  void applyTransferFunction(const Instruction *I,
-                             SmallVectorImpl<const Value *> &Worklist,
-                             DenseSet<const Value *> &EscapedSet);
+  MemorySSA *MSSA = nullptr;
+  LoopInfo *LI = nullptr;
+
+  bool analyzeStoreDestEscapes(SmallVector<const Value *, 32> Worklist,
+                               SmallPtrSet<const Value *, 32> Visited,
+                               const Value *Dest);
 
   /// Solve escape for a single allocation site using backward dataflow.
   bool solveEscapeFor(const Value &Allocation);
@@ -76,7 +75,7 @@ public:
 /// Printer pass for the \c EscapeAnalysis results.
 class EscapeAnalysisPrinterPass
     : public PassInfoMixin<EscapeAnalysisPrinterPass> {
-  /* TMP */ [[maybe_unused]] /* TMP */ raw_ostream &OS;
+  raw_ostream &OS;
 
 public:
   explicit EscapeAnalysisPrinterPass(raw_ostream &OS) : OS(OS) {}

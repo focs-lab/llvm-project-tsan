@@ -45,76 +45,6 @@ WorklistLimit("escape-analysis-worklist-limit", cl::init(10000), cl::Hidden,
 // EscapeAnalysis Implementation
 //===----------------------------------------------------------------------===//
 
-void EscapeAnalysisInfo::applyTransferFunction(
-    const Instruction *I, SmallVectorImpl<const Value *> &Worklist,
-    DenseSet<const Value *> &EscapedSet) {
-  // This is a backward analysis. We check if the instruction's *result* is in
-  // the EscapedSet. If so, we propagate the "escaped" property to its operands.
-
-  if (!EscapedSet.count(I))
-    return; // This instruction doesn't produce an escaped value.
-
-  // The value produced by I escapes. Remove it from the set and add its
-  // relevant operands, propagating the escaped property backward.
-  EscapedSet.erase(I);
-
-  if (isa<GetElementPtrInst>(I) || isa<BitCastInst>(I) || isa<SelectInst>(I)) {
-    // Simple propagation: if a GEP/cast/select result escapes, the base
-    // pointer/operands escape.
-    for (const Use &Op : I->operands()) {
-      const Value *V = Op.get();
-      if (V->getType()->isPointerTy())
-        Worklist.push_back(V);
-    }
-  } else if (const PHINode *PN = dyn_cast<PHINode>(I)) {
-    // For a PHI node, all incoming values are considered to escape.
-    for (const Use &V : PN->incoming_values())
-      if (V.get()->getType()->isPointerTy())
-        Worklist.push_back(V);
-  } else if (const LoadInst *LI = dyn_cast<LoadInst>(I)) {
-    // If a loaded pointer escapes, the pointer it was loaded from also escapes.
-    // This is a key part of handling indirect escapes.
-    Worklist.push_back(LI->getPointerOperand());
-  }
-  // For other instructions (e.g., binary operators), we stop propagation.
-}
-
-/*
-// Helper function to check if value is of supported type for Result set
-static bool isResultTypeValue(const Value *V) {
-  return isa<AllocaInst>(V) || isa<GlobalVariable>(V) || isa<GlobalAlias>(V) ||
-         isa<Argument>(V) || isa<ConstantPointerNull>(V) ||
-         isa<UndefValue>(V) || isa<PoisonValue>(V);
-}
-*/
-
-/*
-static bool handleStore(const Instruction *I,
-                        SmallVectorImpl<const Value *> &Work) {
-  // If it's a store, follow the stored value.
-  if (const auto *SI = dyn_cast<StoreInst>(I)) {
-    if (SI->getValueOperand()) // maybe insert SI itself??
-      Work.push_back(SI->getValueOperand());
-    return true;
-  }
-  return false;
-}
-
-static bool handleCall(SmallPtrSetImpl<const Value *> &Result,
-                       const Instruction *ClobberI) {
-  // If it's a Call/Invoke (CallBase), try to be smarter via attributes.
-  if (const auto *CB = dyn_cast<CallBase>(ClobberI)) {
-    // If the call only reads/doesn't access memory, it can't be a
-    // defining write -> ignore.
-    if (!(CB->onlyReadsMemory() || CB->doesNotAccessMemory())) {
-      Result.insert(CB); // Cannot do anymore with the Call
-      return true;
-    }
-  }
-  return false;
-}
-*/
-
 template <typename PtrT, typename SetT, typename WorklistT>
 static bool tryEnqueueIfNew(PtrT *P, SetT &Seen, WorklistT &WL) {
   if (P && Seen.insert(P).second) {
@@ -363,8 +293,264 @@ Bailout:
       Result.insert(WV);
 }
 
+bool EscapeAnalysisInfo::analyzeStoreDestEscapes(
+    SmallVector<const Value *, 32> Worklist,
+    SmallPtrSet<const Value *, 32> Visited, const Value *Dest) {
+  // Find base objects for the storage location
+  SmallPtrSet<const Value *, 8> BaseObjects;
+  bool IsComplete = false;
+  getUnderlyingObjectsThroughLoads(Dest, MSSA, BaseObjects, LI,
+                                   &IsComplete);
+
+  if (BaseObjects.empty() || !IsComplete) {
+    LLVM_DEBUG(dbgs() << "  Store destination unknown, escapes\n");
+    return true;
+  }
+
+  // Check each base object
+  for (const Value *Base : BaseObjects) {
+    // Global variable - object escapes
+    if (isa<GlobalVariable>(Base) || isa<GlobalAlias>(Base)) {
+      LLVM_DEBUG(dbgs() << "  Stored to global variable, escapes\n");
+      return true;
+    }
+
+    // Function argument - object may escape
+    if (const auto *Arg = dyn_cast<Argument>(Base)) {
+      LLVM_DEBUG(dbgs() << "  Stored to function argument, escapes\n");
+      return true;
+    }
+
+    // If storing to another local allocation
+    if (const auto *AI = dyn_cast<AllocaInst>(Base)) {
+      // Recursively check if this allocation escapes
+      if (Visited.count(AI) == 0) {
+        // Avoid infinite recursion: check cache
+        if (auto CacheIt = Cache.find(AI); CacheIt != Cache.end()) {
+          if (CacheIt->second) {
+            LLVM_DEBUG(dbgs() << "  Stored to escaping alloca, escapes\n");
+            return true;
+          }
+          continue;
+        }
+        // Add to worklist for further analysis
+        tryEnqueueIfNew(AI, Visited, Worklist);
+      }
+      continue;
+    }
+
+    // Unknown base object (e.g., LoadInst)
+    // Conservatively assume the object escapes
+    LLVM_DEBUG(dbgs() << "  Stored to unknown location: " << *Base
+                      << ", escapes\n");
+    return true;
+  } // end for (const Value *Base : BaseObjects)
+  return false;
+}
+
 bool EscapeAnalysisInfo::solveEscapeFor(const Value &AllocationSite) {
-  return true;
+  SmallVector<const Value *, 32> Worklist;
+  SmallPtrSet<const Value *, 32> Visited;
+
+  // Start analysis from the allocation site itself
+  tryEnqueueIfNew(&AllocationSite, Visited, Worklist);
+
+  unsigned StepCount = 0;
+
+  while (!Worklist.empty()) {
+    const Value *V = Worklist.pop_back_val();
+
+    // Safety valve to prevent infinite loops
+    if (++StepCount > WorklistLimit) {
+      LLVM_DEBUG(dbgs() << "  Worklist limit exceeded, conservatively assuming escape\n");
+      return true; // Conservatively assume the object escapes
+    }
+
+    // Check all uses of the current value
+    for (const Use &U : V->uses()) {
+      const auto *I = dyn_cast<Instruction>(U.getUser());
+
+      if (!I) {
+        LLVM_DEBUG(dbgs() << "  Non-instruction user, escapes\n");
+        return true;
+      }
+
+      // Analyze different instruction types using switch
+      switch (I->getOpcode()) {
+      case Instruction::Ret:
+        // Returning pointer from function - object escapes
+        LLVM_DEBUG(dbgs() << "  Returned from function, escapes\n");
+        return true;
+
+      case Instruction::Store: {
+        const auto *SI = cast<StoreInst>(I);
+        // Volatile stores make the address observable
+        if (SI->isVolatile()) {
+          LLVM_DEBUG(dbgs() << "  Volatile store, escapes\n");
+          return true;
+        }
+
+        // Store instruction: check where the pointer is being stored
+        if (SI->getValueOperand() == V) {
+          // Storing a pointer to our object somewhere (operand 0 is the value)
+          if (analyzeStoreDestEscapes(Worklist, Visited,
+                                      SI->getPointerOperand()))
+            return true;
+        }
+        // Storing something else at the address of our object (operand 1).
+        // This does not cause the object itself to escape
+        break;
+      }
+
+      case Instruction::Load: {
+        const auto *LI = cast<LoadInst>(I);
+        // Volatile loads make the address observable
+        if (LI->isVolatile()) {
+          LLVM_DEBUG(dbgs() << "  Volatile load, escapes\n");
+          return true;
+        }
+
+        // Load from our object - does not cause the object itself to escape
+        // (unless the load result is a pointer that subsequently escapes)
+        if (I->getType()->isPointerTy()) {
+          // Load returns a pointer, need to check its uses
+          tryEnqueueIfNew(I, Visited, Worklist);
+        }
+        break;
+      }
+
+      case Instruction::Call:
+      case Instruction::Invoke: {
+        const auto *CB = cast<CallBase>(I);
+
+        // Calling a function pointer does not in itself cause the pointer
+        // to be captured
+        if (CB->isCallee(&U))
+          break;
+
+        // Check if our pointer is passed as an argument
+        bool PassedAsArg = false;
+        for (unsigned ArgNo = 0; ArgNo < CB->arg_size(); ++ArgNo) {
+          if (CB->getArgOperand(ArgNo) == V) {
+            // TODO: Check if argument has nocapture attribute
+            PassedAsArg = true;
+            break;
+          }
+        }
+
+        if (PassedAsArg) {
+          // For safe intrinsics (e.g., lifetime intrinsics)
+          if (const auto *II = dyn_cast<IntrinsicInst>(I)) {
+            switch (II->getIntrinsicID()) {
+            case Intrinsic::lifetime_start:
+            case Intrinsic::lifetime_end:
+            case Intrinsic::invariant_start:
+            case Intrinsic::invariant_end:
+            case Intrinsic::dbg_declare:
+            case Intrinsic::dbg_value:
+            case Intrinsic::dbg_label:
+              // These intrinsics do not cause escape
+              continue;
+            default:
+              break;
+            }
+          }
+
+          // Check for memory intrinsics with volatile flag
+          if (const auto *MI = dyn_cast<MemIntrinsic>(CB)) {
+            if (MI->isVolatile()) {
+              LLVM_DEBUG(dbgs() << "  Volatile memory intrinsic, escapes\n");
+              return true;
+            }
+          }
+
+          // For other functions, conservatively assume the object escapes
+          LLVM_DEBUG(dbgs()
+                     << "  Passed to function call: " << *CB << ", escapes\n");
+          return true;
+        }
+        break;
+      }
+
+      case Instruction::VAArg:
+        // va_arg from a pointer does not cause it to be captured
+        break;
+
+      case Instruction::AtomicRMW: {
+        const auto *ARMWI = cast<AtomicRMWInst>(I);
+        // Volatile atomics make the address observable
+        if (ARMWI->isVolatile()) {
+          LLVM_DEBUG(dbgs() << "  Volatile AtomicRMW, escapes\n");
+          return true;
+        }
+        // If the value being stored is our pointer (operand 1), it escapes
+        if (U.getOperandNo() == 1) {
+          LLVM_DEBUG(dbgs() << "  Stored via AtomicRMW, escapes\n");
+          return true;
+        }
+        // Otherwise, the location being accessed does not cause escape
+        break;
+      }
+
+      case Instruction::AtomicCmpXchg: {
+        const auto *ACXI = cast<AtomicCmpXchgInst>(I);
+        // Volatile atomics make the address observable
+        if (ACXI->isVolatile()) {
+          LLVM_DEBUG(dbgs() << "  Volatile AtomicCmpXchg, escapes\n");
+          return true;
+        }
+        // If the value being compared or stored is our pointer (operands 1 or 2)
+        if (U.getOperandNo() == 1 || U.getOperandNo() == 2) {
+          LLVM_DEBUG(dbgs() << "  Stored via AtomicCmpXchg, escapes\n");
+          return true;
+        }
+        // Otherwise, the location being accessed does not cause escape
+        break;
+      }
+
+      case Instruction::GetElementPtr: {
+        // GEP with vector type should be considered as capture
+        if (I->getType()->isVectorTy()) {
+          LLVM_DEBUG(dbgs() << "  GEP with vector type, escapes\n");
+          return true;
+        }
+        // Simple pointer operation - continue analysis
+        tryEnqueueIfNew(I, Visited, Worklist);
+        break;
+      }
+
+      case Instruction::BitCast:
+      case Instruction::AddrSpaceCast:
+      case Instruction::Select:
+      case Instruction::PHI:
+        // Simple pointer operations - continue analysis
+        tryEnqueueIfNew(I, Visited, Worklist);
+        break;
+
+      case Instruction::ICmp:
+        // Pointer comparison - does not cause escape
+        break;
+
+      case Instruction::PtrToInt:
+        // Converting pointer to integer - conservatively assume escape
+        // (pointer can be reconstructed via inttoptr)
+        LLVM_DEBUG(dbgs() << "  PtrToInt conversion, escapes\n");
+        return true;
+
+      case Instruction::IntToPtr:
+        // This is less common in escape context, but handle conservatively
+        if (I->getType()->isPointerTy())
+          tryEnqueueIfNew(I, Visited, Worklist);
+        break;
+
+      default:
+        // Unknown use type - conservatively assume escape
+        LLVM_DEBUG(dbgs() << "  Unknown use: " << *I << ", escapes\n");
+        return true;
+      }
+    }
+  }
+  return false; // If we checked all uses and found no escapes
 }
 
 bool EscapeAnalysisInfo::isEscaping(const Value &Alloc) {
@@ -372,9 +558,8 @@ bool EscapeAnalysisInfo::isEscaping(const Value &Alloc) {
   //    simple cases of PHIs and selects pointing to the same object.
   const Value *UnderlyingObj = getUnderlyingObjectAggressive(&Alloc);
 
-  // 2. Check cache for a previously computed result.
-  const auto CacheIt = Cache.find(UnderlyingObj);
-  if (CacheIt != Cache.end())
+  // 2. Check the cache for a previously computed result.
+  if (const auto CacheIt = Cache.find(UnderlyingObj); CacheIt != Cache.end())
     return CacheIt->second;
 
   // 3. If not in cache, run the analysis.
@@ -382,7 +567,10 @@ bool EscapeAnalysisInfo::isEscaping(const Value &Alloc) {
   NumAllocationsAnalyzed++;
 
   // Lazily get other analyses from the FAM.
-  // AAResults &AA = FAM.getResult<AAManager>(F);
+  if (!MSSA)
+    MSSA = &FAM.getResult<MemorySSAAnalysis>(F).getMSSA();
+  if (!LI)
+    LI = &FAM.getResult<LoopAnalysis>(F);
 
   const bool Result = solveEscapeFor(*UnderlyingObj);
 
@@ -407,7 +595,6 @@ bool EscapeAnalysisInfo::invalidate(Function &F, const PreservedAnalyses &PA,
   return false;
 }
 
-
 AnalysisKey EscapeAnalysis::Key;
 
 EscapeAnalysis::Result EscapeAnalysis::run(Function &F,
@@ -425,7 +612,7 @@ EscapeAnalysisPrinterPass::run(Function &F, FunctionAnalysisManager &AM) const {
   if (F.isDeclaration())
     return PreservedAnalyses::all();
 
-  dbgs() << "EscapeAnalysis for function: " << F.getName() << "\n";
+  OS << "EscapeAnalysis for function: " << F.getName() << "\n";
 
   bool HasInterestingAllocs = false;
   auto &EA = AM.getResult<EscapeAnalysis>(F);
@@ -443,14 +630,13 @@ EscapeAnalysisPrinterPass::run(Function &F, FunctionAnalysisManager &AM) const {
     if (IsAllocation) {
       HasInterestingAllocs = true;
       const bool Escapes = EA.isEscaping(I);
-      dbgs() << "  Allocation " << I.getName() << ": "
+      OS << "  Allocation " << I.getName() << ": "
              << (Escapes ? "ESCAPES" : "DOES NOT ESCAPE") << "\n";
     }
   }
 
   if (!HasInterestingAllocs)
-    dbgs() << "  No allocations to analyze.\n";
+    OS << "  No allocations to analyze.\n";
 
   return PreservedAnalyses::all();
 }
-
