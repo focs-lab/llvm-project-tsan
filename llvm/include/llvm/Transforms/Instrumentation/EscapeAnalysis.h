@@ -118,7 +118,7 @@ private:
     bool Escaped = false;
 
     /// Analyze if storing to destination causes escape
-    bool doesStoreDestinationEscape(const StoreInst *SI);
+    bool doesStoreDestinationEscape(const Value *Dest) const;
   };
 
   /// Solve escape for a single allocation site using backward dataflow.
