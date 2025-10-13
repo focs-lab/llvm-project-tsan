@@ -37,7 +37,7 @@ STATISTIC(NumAllocationsEscaped, "Number of allocation sites found to escape");
 /// worklist nodes exceeds this limit, the analysis bails out conservatively and
 /// considers the allocation as escaping.
 static cl::opt<unsigned>
-WorklistLimit("escape-analysis-worklist-limit", cl::init(10000), cl::Hidden,
+WorklistLimit("escape-analysis-worklist-limit", cl::init(1000), cl::Hidden,
               cl::desc("Max number of worklist nodes processed per allocation; "
                        "if exceeded, assume the allocation escapes"));
 
@@ -307,9 +307,13 @@ bool EscapeAnalysisInfo::EscapeCaptureTracker::doesStoreDestinationEscape(
       }
 
       // Recurse to decide whether the target alloca itself escapes.
+      // Before recursion, mark as "in progress"
+      EAI.Cache[Alloca] = true; // Pessimistic assumption during analysis
       auto RecursiveProcessingSet = ProcessingSet;
       RecursiveProcessingSet.insert(Alloca);
-      if (EAI.solveEscapeFor(*Alloca, RecursiveProcessingSet)) {
+      const bool Escapes = EAI.solveEscapeFor(*Alloca, RecursiveProcessingSet);
+      EAI.Cache[Alloca] = Escapes;
+      if (Escapes) {
         LLVM_DEBUG(dbgs() << "  Stored to escaping alloca, escapes\n");
         return true;
       }
@@ -332,6 +336,16 @@ EscapeAnalysisInfo::EscapeCaptureTracker::captured(const Use *U,
   if (capturesNothing(CI.UseCC)) {
     LLVM_DEBUG(dbgs() << "    Use doesn't capture, continue\n");
     return Continue; // CaptureTracking says it's not captured, continue
+  }
+
+  // Early check for vector operations
+  if ((I->getType()->isVectorTy() &&
+       I->getType()->getScalarType()->isPointerTy()) ||
+      (U->get()->getType()->isVectorTy() &&
+       U->get()->getType()->getScalarType()->isPointerTy())) {
+    LLVM_DEBUG(dbgs() << "  Vector pointer operation, escapes\n");
+    Escaped = true;
+    return Stop;
   }
 
   // Passthrough ops (gep/bitcast/select/phi..) should be explored transitively.
