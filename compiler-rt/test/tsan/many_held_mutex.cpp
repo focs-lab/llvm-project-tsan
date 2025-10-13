@@ -1,4 +1,4 @@
-// RUN: %clangxx_tsan -O1 %s %link_libcxx_tsan -fsanitize=thread -o %t
+// RUN: %clangxx_tsan -O1 %s %link_libcxx_tsan -fsanitize=thread -mllvm -tsan-use-dominance-analysis -o %t
 // RUN: %run %t 128
 
 #include <mutex>
