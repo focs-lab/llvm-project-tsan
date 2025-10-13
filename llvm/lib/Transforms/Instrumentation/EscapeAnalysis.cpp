@@ -97,8 +97,7 @@ void EscapeAnalysisInfo::getUnderlyingObjectsThroughLoads(
 
   auto markTerminal = [&](const Value *Term,
                           bool ForceIncompleteIfNotBase = true) {
-    if (!Term || !Term->getType()->isPointerTy())
-      return;
+    if (!Term || !Term->getType()->isPointerTy()) return;
 
     const bool IsBase = isa<AllocaInst>(Term) || isa<GlobalVariable>(Term) ||
                         isa<GlobalAlias>(Term) || isa<Argument>(Term) ||
@@ -201,8 +200,8 @@ void EscapeAnalysisInfo::getUnderlyingObjectsThroughLoads(
           // treat as unknown/opaque write.
         }
         // NOTE: We intentionally don't consider the source in memintrinsics
-        // such as memset/memcpy/memset as underlying objects, because it's
-        // wrong semantics.
+        // (e.g. memmove/memcpy/memset) because they are not semantically
+        // underlying objects
 
         // Fallback: unrecognized defining write, stop here conservatively.
         Fallback = true;
@@ -246,10 +245,11 @@ void EscapeAnalysisInfo::getUnderlyingObjectsThroughLoads(
 
 Bailout:
   LLVM_DEBUG(dbgs() << "getUnderlyingObjectsThroughLoads: MaxSteps exceeded\n");
+  if (IsComplete)
+    *IsComplete = false;
   // Conservative: mark all remaining items as terminals
   for (const Value *WV : Work)
-    if (WV && WV->getType()->isPointerTy())
-      Result.insert(WV);
+    markTerminal(WV);
 }
 
 //===----------------------------------------------------------------------===//
@@ -262,69 +262,60 @@ bool EscapeAnalysisInfo::EscapeCaptureTracker::shouldExplore(const Use *U) {
 }
 
 bool EscapeAnalysisInfo::EscapeCaptureTracker::doesStoreDestinationEscape(
-    const StoreInst *SI) {
-  const Value *Dest = SI->getPointerOperand();
-
-  // Find base objects for the storage location using our enhanced analysis
+    const Value *Dest) const {
+  // Find base objects for the storage location
   SmallPtrSet<const Value *, 8> BaseObjects;
   bool IsComplete = false;
   getUnderlyingObjectsThroughLoads(Dest, EAI.MSSA, BaseObjects, EAI.LI,
                                    &IsComplete);
 
+  // If bases are unknown or the walk is incomplete, be conservative.
   if (BaseObjects.empty() || !IsComplete) {
-    LLVM_DEBUG(dbgs() << "  Store destination unknown, escapes\n");
+    LLVM_DEBUG(dbgs() << "  Store destination unknown/incomplete, escapes\n");
     return true;
   }
 
-  // Check each base object
   for (const Value *Base : BaseObjects) {
-    // Global variable - object escapes
     if (isa<GlobalVariable>(Base) || isa<GlobalAlias>(Base)) {
-      LLVM_DEBUG(dbgs() << "  Stored to global variable, escapes\n");
+      LLVM_DEBUG(dbgs() << "  Stored to global, escapes\n");
       return true;
     }
 
-    // Function argument - object may escape (unless nocapture)
-    if (const auto *Arg = dyn_cast<Argument>(Base)) {
-      if (!Arg->hasNoCaptureAttr()) {
-        LLVM_DEBUG(dbgs() << "  Stored to non-nocapture argument, escapes\n");
-        return true;
-      }
-      continue;
+    // Any memory reachable through a function Argument is externally visible.
+    if (isa<Argument>(Base)) {
+      LLVM_DEBUG(
+          dbgs() << "  Stored to memory reachable from argument, escapes\n");
+      return true;
     }
 
     // If storing to another local allocation, recursively check if it escapes
     if (const auto *Alloca = dyn_cast<AllocaInst>(Base)) {
-      // Prevent recursion by checking if we're already processing this alloca
+      // Cycle in the current recursion indicates incomplete local reasoning.
+      // Without a global fixpoint, treat as escape to remain conservative.
       if (ProcessingSet.count(Alloca)) {
-        // Cyclic dependency - conservatively assume escape
-        // LLVM_DEBUG(dbgs() << "  Cyclic store dependency, escapes\n");
-        // return true;
-        LLVM_DEBUG(dbgs() << "  Cyclic store dependency detected, assuming safe\n");
-        continue;
+        LLVM_DEBUG(dbgs() << "  Cyclic store dependency, escapes\n");
+        return true;
       }
 
-      // Check cache first
+      // If cache says the alloca escapes, propagate escape.
       if (auto CacheIt = EAI.Cache.find(Alloca); CacheIt != EAI.Cache.end()) {
         if (CacheIt->second) {
           LLVM_DEBUG(dbgs() << "  Stored to escaping (cached), escapes\n");
           return true;
         }
-        continue;
+        continue; // Cached non-escape: keep checking other bases.
       }
 
-      // Recursively analyze this allocation
+      // Recurse to decide whether the target alloca itself escapes.
       auto RecursiveProcessingSet = ProcessingSet;
       RecursiveProcessingSet.insert(Alloca);
-
       if (EAI.solveEscapeFor(*Alloca, RecursiveProcessingSet)) {
         LLVM_DEBUG(dbgs() << "  Stored to escaping alloca, escapes\n");
         return true;
       }
       continue;
     }
-    // Unknown base object (e.g., LoadInst, Call result)
-    // Conservatively assume the object escapes
+    // Any other/unknown terminal means the destination is not proven local.
     LLVM_DEBUG(dbgs() << "  Stored to unknown location: " << *Base
                       << ", escapes\n");
     return true;
@@ -337,40 +328,27 @@ EscapeAnalysisInfo::EscapeCaptureTracker::captured(const Use *U,
                                                    UseCaptureInfo CI) {
   const auto *I = cast<Instruction>(U->getUser());
 
-  // First, use the standard CaptureTracking analysis to filter obvious cases
-
-  // === Case 1: Not captured at all by this use ===
-  // If CaptureTracking says it's not captured at all, we can continue
+  // If CaptureTracking says this use does not capture, continue exploring.
   if (capturesNothing(CI.UseCC)) {
     LLVM_DEBUG(dbgs() << "    Use doesn't capture, continue\n");
-    return Continue;
+    return Continue; // CaptureTracking says it's not captured, continue
   }
 
-  // === Case 2: Not captured at all by this use ===
-  // These are typically passthrough - continue analyzing the result
+  // Passthrough ops (gep/bitcast/select/phi..) should be explored transitively.
   if (CI.isPassthrough()) {
     LLVM_DEBUG(dbgs() << "    Passthrough operation, continue to result\n");
     return Continue;
   }
 
-  // === Case 3: UseCC indicates some form of capture ===
   // Now handle special cases where CaptureTracking says it's captured,
   // but we need more sophisticated escape analysis
 
-  // Special handling for Store instructions
   if (const auto *SI = dyn_cast<StoreInst>(I)) {
-    // Volatile stores always escape (observable side effect)
-    if (SI->isVolatile() || SI->isAtomic()) {
-      LLVM_DEBUG(dbgs() << "    Volatile or atomic store, escapes\n");
-      Escaped = true;
-      return Stop;
-    }
-
     // Check if we're storing the pointer (not storing to it)
     if (SI->getValueOperand() == U->get()) {
       LLVM_DEBUG(dbgs() << "    Storing pointer value, analyze destination\n");
-      // Use MemorySSA-based analysis to check if the destination itself escapes
-      if (doesStoreDestinationEscape(SI)) {
+      if (SI->isVolatile() || SI->isAtomic() ||
+          doesStoreDestinationEscape(SI->getPointerOperand())) {
         LLVM_DEBUG(dbgs() << "  Store to escaping destination, escapes\n");
         Escaped = true;
         return Stop;
@@ -378,31 +356,28 @@ EscapeAnalysisInfo::EscapeCaptureTracker::captured(const Use *U,
       LLVM_DEBUG(dbgs() << "    Store to safe local, doesn't escape\n");
       return ContinueIgnoringReturn;
     }
-    // If we reach here, we're used as the pointer operand (store destination).
-    // Storing through our pointer doesn't cause the pointer itself to escape.
+    // If we are the destination pointer, this use does not capture the value.
     LLVM_DEBUG(dbgs() << "    Used as store destination, doesn't escape\n");
-    return Continue;
+    return ContinueIgnoringReturn;
   }
 
-  // === Special case: Comparison ===
-  if (isa<ICmpInst>(I)) {
-    // Comparisons capture only the address, not the object itself for escape purposes
-    // For escape analysis, comparing pointers doesn't cause escape
+  if (isa<ICmpInst>(I)) { // Pure comparisons of addresses do not cause escape.
     LLVM_DEBUG(dbgs() << "    Pointer comparison, doesn't escape\n");
     return ContinueIgnoringReturn;
   }
 
-  // === Default case: Trust CaptureTracking's judgment ===
-  // If CI.UseCC indicates capture and we haven't handled it specially above,
-  // then it's a capture that causes escape
+  // Default: if CaptureTracking still indicates capture, treat as escape.
   if (capturesAnything(CI.UseCC)) {
     LLVM_DEBUG(dbgs() << "  Captured by: " << *I << "\n");
     Escaped = true;
     return Stop;
   }
 
+#ifndef NDEBUG
   llvm_unreachable("Unhandled case in EscapeCaptureTracker::captured");
+#else
   return Continue;
+#endif
 }
 
 //===----------------------------------------------------------------------===//
@@ -461,11 +436,11 @@ bool EscapeAnalysisInfo::isEscaping(const Value &Alloc) {
 
 bool EscapeAnalysisInfo::invalidate(Function &F, const PreservedAnalyses &PA,
                                     FunctionAnalysisManager::Invalidator &Inv) {
+  if (Inv.invalidate<MemorySSAAnalysis>(F, PA) ||
+      Inv.invalidate<LoopAnalysis>(F, PA))
+    return true;
   if (!PA.getChecker<EscapeAnalysis>().preserved())
     return true;
-
-  // If dependant analysis invalidated - invalidate too
-  // if (Inv.invalidate<AAManager>(F, PA)) return true;
   return false;
 }
 
