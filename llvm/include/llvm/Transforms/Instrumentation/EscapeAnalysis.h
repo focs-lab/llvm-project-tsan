@@ -127,6 +127,12 @@ private:
   /// Solve escape for a single allocation site using backward dataflow.
   bool solveEscapeFor(const Value &Allocation,
                       SmallPtrSet<const Value *, 32> &ProcessingSet);
+
+  // Helper function to detect heap allocations.
+  // Required because isAllocationFn() requires the 'allockind' attribute,
+  // which older Clang versions don't generate for malloc/calloc/etc.
+  static bool isHeapAllocation(const CallBase *CB,
+                               const TargetLibraryInfo *TLI);
 };
 
 /// EscapeAnalysisInfo wrapper for the new pass manager.

@@ -402,6 +402,43 @@ bool EscapeAnalysisInfo::solveEscapeFor(
   return Tracker.hasEscaped();
 }
 
+bool EscapeAnalysisInfo::isHeapAllocation(const CallBase *CB,
+                                          const TargetLibraryInfo *TLI) {
+  // Try standard path first (works for C++ new and modern IR with allockind)
+  if (isAllocationFn(CB, TLI) || isNewLikeFn(CB, TLI))
+    return true;
+
+  // Fallback: check directly via TLI for malloc/calloc/etc
+  const Function *Callee = CB->getCalledFunction();
+  if (!Callee || !Callee->getReturnType()->isPointerTy())
+    return false;
+
+  LibFunc Func;
+  if (!TLI->getLibFunc(*Callee, Func) || !TLI->has(Func))
+    return false;
+
+  // List of known heap allocation functions from libc
+  switch (Func) {
+  case LibFunc_malloc:
+  case LibFunc_calloc:
+  case LibFunc_realloc:
+  case LibFunc_reallocf:
+  case LibFunc_reallocarray:
+  case LibFunc_valloc:
+  case LibFunc_pvalloc:
+  case LibFunc_aligned_alloc:
+  case LibFunc_memalign:
+  case LibFunc_vec_malloc:
+  case LibFunc_vec_calloc:
+  case LibFunc_vec_realloc:
+  case LibFunc_strdup:
+  case LibFunc_strndup:
+    return true;
+  default:
+    return false;
+  }
+}
+
 bool EscapeAnalysisInfo::isEscaping(const Value &Alloc) {
   // 1. Get the underlying object
   const Value *UnderlyingObj = getUnderlyingObjectAggressive(&Alloc);
@@ -443,125 +480,8 @@ void EscapeAnalysisInfo::print(raw_ostream &OS) {
     bool IsAllocation = false;
     if (isa<AllocaInst>(I)) {
       IsAllocation = true;
-    } else if (isa<CallBase>(&I)) {
-      IsAllocation = isAllocationFn(&I, &TLI) || isNewLikeFn(&I, &TLI);
-    }
-
-    if (!IsAllocation)
-      continue;
-
-    Any = true;
-
-    // Stable symbol: use SSA name if exists, otherwise "unnamed#N".
-    StringRef Name = I.hasName() ? I.getName() : StringRef();
-    SmallString<32> Gen;
-    if (Name.empty()) {
-      ++UnnamedCount;
-      Gen += "unnamed#";
-      Gen += Twine(UnnamedCount).str();
-      Name = Gen;
-    }
-
-    const bool Esc = isEscaping(I);
-    OS << "  " << Name << " escapes: " << (Esc ? "yes" : "no") << "\n";
-  }
-
-  if (!Any)
-    OS << "  none\n";
-  OS << "\n";
-}
-
-/*
-void EscapeAnalysisInfo::print(raw_ostream &OS) {
-  auto &TLI = FAM.getResult<TargetLibraryAnalysis>(F);
-
-  OS << "=== DIAGNOSTIC INFO ===\n";
-  OS << "Module triple: " << F.getParent()->getTargetTriple().str() << "\n";
-  OS << "Function: " << F.getName() << "\n";
-  OS << "Function attributes: ";
-  for (auto Attr : F.getAttributes().getFnAttrs()) {
-    OS << Attr.getAsString() << " ";
-  }
-  OS << "\n\n";
-
-  bool Any = false;
-  unsigned UnnamedCount = 0;
-
-  for (Instruction &I : instructions(F)) {
-    bool IsAllocation = false;
-
-    if (isa<AllocaInst>(I)) {
-      IsAllocation = true;
-      OS << "Found alloca: " << I << "\n";
     } else if (const auto *CB = dyn_cast<CallBase>(&I)) {
-      const Function *Callee = CB->getCalledFunction();
-
-      OS << "\n--- Analyzing call instruction ---\n";
-      OS << "Full instruction: " << *CB << "\n";
-
-      if (Callee) {
-        OS << "Called function name: " << Callee->getName() << "\n";
-        OS << "Called function is declaration: " << Callee->isDeclaration() << "\n";
-        OS << "Called function is intrinsic: " << Callee->isIntrinsic() << "\n";
-
-        // Проверяем атрибуты функции
-        OS << "Function attributes: ";
-        for (auto Attr : Callee->getAttributes().getFnAttrs()) {
-          OS << Attr.getAsString() << " ";
-        }
-        OS << "\n";
-
-        // Проверяем атрибуты вызова
-        OS << "Call site attributes: ";
-        for (auto Attr : CB->getAttributes().getFnAttrs()) {
-          OS << Attr.getAsString() << " ";
-        }
-        OS << "\n";
-
-        OS << "CB->isNoBuiltin(): " << CB->isNoBuiltin() << "\n";
-
-        // Проверяем, знает ли TLI об этой функции
-        LibFunc LibFn;
-        if (TLI.getLibFunc(*Callee, LibFn)) {
-          OS << "TLI recognizes function as LibFunc ID: " << (int)LibFn << "\n";
-          OS << "TLI says function is available: " << TLI.has(LibFn) << "\n";
-
-          // Проверяем конкретно malloc
-          if (LibFn == LibFunc_malloc) {
-            OS << "This IS malloc according to TLI!\n";
-          }
-        } else {
-          OS << "TLI does NOT recognize this function\n";
-
-          // Попробуем понять почему
-          OS << "Trying to understand why TLI doesn't recognize it:\n";
-          OS << "  Function name string: '" << Callee->getName().str() << "'\n";
-          OS << "  Function name size: " << Callee->getName().size() << "\n";
-          OS << "  Comparing with 'malloc': " << (Callee->getName() == "malloc") << "\n";
-        }
-
-        // Проверяем через isAllocationFn
-        bool IsAllocFn = isAllocationFn(CB, &TLI);
-        bool IsNewLike = isNewLikeFn(CB, &TLI);
-        bool IsAllocLike = isAllocLikeFn(CB, &TLI);
-        bool IsMallocOrCallocLike = isMallocOrCallocLikeFn(CB, &TLI);
-
-        OS << "isAllocationFn result: " << IsAllocFn << "\n";
-        OS << "isNewLikeFn result: " << IsNewLike << "\n";
-        OS << "isAllocLikeFn result: " << IsAllocLike << "\n";
-        OS << "isMallocOrCallocLikeFn result: " << IsMallocOrCallocLike << "\n";
-
-        // Проверяем через getObjectSize (иногда это тоже помогает)
-        OS << "Has allocsize attribute: "
-           << Callee->hasFnAttribute(Attribute::AllocSize) << "\n";
-
-        IsAllocation = IsAllocFn || IsNewLike;
-      } else {
-        OS << "Indirect call (no direct callee)\n";
-      }
-
-      OS << "Final IsAllocation decision: " << IsAllocation << "\n";
-      OS << "--- End of call analysis ---\n\n";
+      IsAllocation = isHeapAllocation(CB, &TLI);
     }
 
     if (!IsAllocation)
@@ -587,7 +507,6 @@ void EscapeAnalysisInfo::print(raw_ostream &OS) {
     OS << "  none\n";
   OS << "\n";
 }
-*/
 
 bool EscapeAnalysisInfo::invalidate(Function &F, const PreservedAnalyses &PA,
                                     FunctionAnalysisManager::Invalidator &Inv) {
