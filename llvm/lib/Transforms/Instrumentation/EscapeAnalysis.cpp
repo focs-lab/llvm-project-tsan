@@ -448,23 +448,20 @@ bool EscapeAnalysisInfo::isAllocationSite(const Value *V,
 }
 
 bool EscapeAnalysisInfo::isEscaping(const Value &Alloc) {
-  // Get the underlying object
-  const Value *UnderlyingObj = getUnderlyingObjectAggressive(&Alloc);
-
   // Validate input
   auto &TLI = FAM.getResult<TargetLibraryAnalysis>(F);
-  if (!isAllocationSite(&UnderlyingObj, &TLI)) {
+  if (!isAllocationSite(&Alloc, &TLI)) {
     LLVM_DEBUG(dbgs() << "EscapeAnalysis: Not an allocation site: "
-                      << UnderlyingObj << "\n");
+                      << &Alloc << "\n");
     return true; // Conservative: unknown things "escape"
   }
 
   // Check the cache for a previously computed result
-  if (const auto CacheIt = Cache.find(UnderlyingObj); CacheIt != Cache.end())
+  if (const auto CacheIt = Cache.find(&Alloc); CacheIt != Cache.end())
     return CacheIt->second;
 
   // If not in cache, run the analysis
-  LLVM_DEBUG(dbgs() << "EscapeAnalysis: Analyzing " << *UnderlyingObj << "\n");
+  LLVM_DEBUG(dbgs() << "EscapeAnalysis: Analyzing " << Alloc << "\n");
   NumAllocationsAnalyzed++;
 
   if (!MSSA)
@@ -474,13 +471,13 @@ bool EscapeAnalysisInfo::isEscaping(const Value &Alloc) {
 
   // Track allocations being processed to detect cycles
   SmallPtrSet<const Value *, 32> ProcessingSet;
-  const bool IsEscaped = solveEscapeFor(*UnderlyingObj, ProcessingSet);
+  const bool IsEscaped = solveEscapeFor(Alloc, ProcessingSet);
 
   if (IsEscaped)
     NumAllocationsEscaped++;
 
   // 4. Store result in cache and return
-  return Cache[UnderlyingObj] = IsEscaped;
+  return Cache[(&Alloc)] = IsEscaped;
 }
 
 void EscapeAnalysisInfo::print(raw_ostream &OS) {
