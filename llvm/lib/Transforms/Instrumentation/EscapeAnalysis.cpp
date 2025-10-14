@@ -438,20 +438,35 @@ bool EscapeAnalysisInfo::isHeapAllocation(const CallBase *CB,
     return false;
   }
 }
+bool EscapeAnalysisInfo::isAllocationSite(const Value *V,
+                                          const TargetLibraryInfo *TLI) {
+  if (isa<AllocaInst>(V))
+    return true;
+  if (const auto *CB = dyn_cast<CallBase>(V))
+    return isHeapAllocation(CB, TLI);
+  return false;
+}
 
 bool EscapeAnalysisInfo::isEscaping(const Value &Alloc) {
-  // 1. Get the underlying object
+  // Get the underlying object
   const Value *UnderlyingObj = getUnderlyingObjectAggressive(&Alloc);
 
-  // 2. Check the cache for a previously computed result
+  // Validate input
+  auto &TLI = FAM.getResult<TargetLibraryAnalysis>(F);
+  if (!isAllocationSite(&UnderlyingObj, &TLI)) {
+    LLVM_DEBUG(dbgs() << "EscapeAnalysis: Not an allocation site: "
+                      << UnderlyingObj << "\n");
+    return true; // Conservative: unknown things "escape"
+  }
+
+  // Check the cache for a previously computed result
   if (const auto CacheIt = Cache.find(UnderlyingObj); CacheIt != Cache.end())
     return CacheIt->second;
 
-  // 3. If not in cache, run the analysis
+  // If not in cache, run the analysis
   LLVM_DEBUG(dbgs() << "EscapeAnalysis: Analyzing " << *UnderlyingObj << "\n");
   NumAllocationsAnalyzed++;
 
-  // Lazily get other analyses from the FAM
   if (!MSSA)
     MSSA = &FAM.getResult<MemorySSAAnalysis>(F).getMSSA();
   if (!LI)
@@ -459,13 +474,13 @@ bool EscapeAnalysisInfo::isEscaping(const Value &Alloc) {
 
   // Track allocations being processed to detect cycles
   SmallPtrSet<const Value *, 32> ProcessingSet;
-  const bool Result = solveEscapeFor(*UnderlyingObj, ProcessingSet);
+  const bool IsEscaped = solveEscapeFor(*UnderlyingObj, ProcessingSet);
 
-  if (Result)
+  if (IsEscaped)
     NumAllocationsEscaped++;
 
   // 4. Store result in cache and return
-  return Cache[UnderlyingObj] = Result;
+  return Cache[UnderlyingObj] = IsEscaped;
 }
 
 void EscapeAnalysisInfo::print(raw_ostream &OS) {
@@ -477,14 +492,7 @@ void EscapeAnalysisInfo::print(raw_ostream &OS) {
   unsigned UnnamedCount = 0;
 
   for (Instruction &I : instructions(F)) {
-    bool IsAllocation = false;
-    if (isa<AllocaInst>(I)) {
-      IsAllocation = true;
-    } else if (const auto *CB = dyn_cast<CallBase>(&I)) {
-      IsAllocation = isHeapAllocation(CB, &TLI);
-    }
-
-    if (!IsAllocation)
+    if (!isAllocationSite(&I, &TLI))
       continue;
 
     Any = true;

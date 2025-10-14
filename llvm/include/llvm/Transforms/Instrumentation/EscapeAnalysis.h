@@ -41,7 +41,12 @@ struct EscapeAnalysisInfo {
       : F(F), FAM(FAM) {};
   ~EscapeAnalysisInfo() = default;
 
-  /// Return true if \p Allocation may escape the function.
+  /// Return true if \p Alloc may escape the function.
+  /// \param Alloc - Must be an allocation site (AllocaInst or heap allocation
+  ///                call). Passing GEPs/bitcasts is not supported; use the base
+  ///                allocation.
+  /// \returns true if the allocation escapes or if \p Alloc is not an
+  /// allocation site.
   bool isEscaping(const Value &Alloc);
 
   /// Print escape information for all allocations in the function
@@ -133,6 +138,10 @@ private:
   // which older Clang versions don't generate for malloc/calloc/etc.
   static bool isHeapAllocation(const CallBase *CB,
                                const TargetLibraryInfo *TLI);
+
+  /// Helper function to detect allocation sites (malloc/new-like)
+  /// Returns true if V is an Alloca or a call to a known heap alloc function.
+  static bool isAllocationSite(const Value *V, const TargetLibraryInfo *TLI);
 };
 
 /// EscapeAnalysisInfo wrapper for the new pass manager.
