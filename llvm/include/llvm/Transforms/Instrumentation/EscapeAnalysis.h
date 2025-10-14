@@ -44,6 +44,9 @@ struct EscapeAnalysisInfo {
   /// Return true if \p Allocation may escape the function.
   bool isEscaping(const Value &Alloc);
 
+  /// Print escape information for all allocations in the function
+  void print(raw_ostream &OS);
+
   bool invalidate(Function &F, const PreservedAnalyses &PA,
                   FunctionAnalysisManager::Invalidator &Inv);
 
@@ -143,7 +146,7 @@ class EscapeAnalysisPrinterPass
 
 public:
   explicit EscapeAnalysisPrinterPass(raw_ostream &OS) : OS(OS) {}
-  PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM) const;
+  PreservedAnalyses run(Function &F, FunctionAnalysisManager &FAM) const;
   static bool isRequired() { return true; }
 };
 
