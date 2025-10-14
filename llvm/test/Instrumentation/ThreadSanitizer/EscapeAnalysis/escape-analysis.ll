@@ -12,6 +12,7 @@ target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f3
 @G = global ptr null
 
 declare noalias ptr @malloc(i64)
+declare noalias ptr @external(i64)
 
 ; ----------------------------------------
 ; No allocations
@@ -143,5 +144,17 @@ define void @cycle_allocas_escape() {
   %b = alloca ptr, align 8
   store ptr %a, ptr %b
   store ptr %b, ptr %a
+  ret void
+}
+
+; ----------------------------------------
+; Store to the pointer, returned by an external function -> escape
+; ----------------------------------------
+define void @store_to_unknown_ret_escape() {
+; CHECK-LABEL: Printing analysis 'Escape Analysis' for function 'store_to_unknown_ret_escape':
+; CHECK: a escapes: yes
+  %a = alloca i8, align 1
+  %p = call ptr @external(i64 16)
+  store ptr %a, ptr %p
   ret void
 }
