@@ -179,9 +179,9 @@ void EscapeAnalysisInfo::getUnderlyingObjectsThroughLoads(
         continue; // We are done
       }
 
-      if (auto *MD = dyn_cast<MemoryDef>(CurrClobber)) {
+      if (auto *MDef = dyn_cast<MemoryDef>(CurrClobber)) {
         // If clobber is a MemoryDef, inspect its instruction.
-        const Instruction *ClobberI = MD->getMemoryInst();
+        const Instruction *ClobberI = MDef->getMemoryInst();
         assert(ClobberI && "MemoryDef must have an instruction");
 
         // Stores: chase the stored pointer when safe; otherwise, conservatively stop.
@@ -208,13 +208,13 @@ void EscapeAnalysisInfo::getUnderlyingObjectsThroughLoads(
         break;
       }
 
-      if (const auto *MP = dyn_cast<MemoryPhi>(CurrClobber)) {
+      if (const auto *MPhi = dyn_cast<MemoryPhi>(CurrClobber)) {
         // Iterate the incoming accesses and process each incoming
         // MemoryAccess.
-        appendUnvisitedIncomingMAs(MP, VisitedMA, MAWorkList);
-      } else if (auto *MU = dyn_cast<MemoryUse>(CurrClobber)) {
+        appendUnvisitedIncomingMAs(MPhi, VisitedMA, MAWorkList);
+      } else if (auto *MUse = dyn_cast<MemoryUse>(CurrClobber)) {
         // If clobber is a MemoryUse (rarely but possible), get its defining.
-        MemoryAccess *Def = Walker->getClobberingMemoryAccess(MU);
+        MemoryAccess *Def = Walker->getClobberingMemoryAccess(MUse);
         if (!Def) {
           Fallback = true;
           break;
@@ -262,7 +262,7 @@ bool EscapeAnalysisInfo::EscapeCaptureTracker::shouldExplore(const Use *U) {
 }
 
 bool EscapeAnalysisInfo::EscapeCaptureTracker::doesStoreDestinationEscape(
-    const Value *Dest) const {
+    const Value *Dest) {
   // Find base objects for the storage location
   SmallPtrSet<const Value *, 8> BaseObjects;
   bool IsComplete = false;
@@ -298,6 +298,7 @@ bool EscapeAnalysisInfo::EscapeCaptureTracker::doesStoreDestinationEscape(
       }
 
       // If cache says the alloca escapes, propagate escape.
+      // TODO: maybe move Cache check to solveEscapeFor?
       if (auto CacheIt = EAI.Cache.find(Alloca); CacheIt != EAI.Cache.end()) {
         if (CacheIt->second) {
           LLVM_DEBUG(dbgs() << "  Stored to escaping (cached), escapes\n");
@@ -307,9 +308,9 @@ bool EscapeAnalysisInfo::EscapeCaptureTracker::doesStoreDestinationEscape(
       }
 
       // Recurse to decide whether the target alloca itself escapes.
-      auto RecursiveProcessingSet = ProcessingSet;
-      RecursiveProcessingSet.insert(Alloca);
-      if (EAI.solveEscapeFor(*Alloca, RecursiveProcessingSet)) {
+      // auto RecursiveProcessingSet = ProcessingSet;
+      // RecursiveProcessingSet.insert(Alloca);
+      if (EAI.solveEscapeFor(*Alloca, ProcessingSet)) {
         LLVM_DEBUG(dbgs() << "  Stored to escaping alloca, escapes\n");
         return true;
       }
@@ -323,9 +324,54 @@ bool EscapeAnalysisInfo::EscapeCaptureTracker::doesStoreDestinationEscape(
   return false;
 }
 
+bool EscapeAnalysisInfo::EscapeCaptureTracker::doesStoredPointerEscapeViaLoads(
+    const StoreInst *Store, SmallPtrSet<const Value *, 32> &ProcessingSet) {
+  if (!EAI.MSSA) return true;
+  auto *MDef = dyn_cast<MemoryDef>(EAI.MSSA->getMemoryAccess(Store));
+  if (!MDef) return true;
+
+  SmallVector<MemoryAccess *, 32> MAWorkList;
+  SmallPtrSet<MemoryAccess *, 32> VisitedMA;
+  MAWorkList.push_back(MDef);
+  VisitedMA.insert(MDef);
+
+  MemorySSAWalker *Walker = EAI.MSSA->getWalker();
+
+  unsigned Steps = 0;
+  while (!MAWorkList.empty()) {
+    if (++Steps > WorklistLimit) return true;
+    MemoryAccess *MA = MAWorkList.pop_back_val();
+
+    for (User *U : MA->users()) {
+      if (auto *MUse = dyn_cast<MemoryUse>(U)) {
+        if (Walker->getClobberingMemoryAccess(MUse) != MA)
+          continue;
+
+        if (const auto *Load = dyn_cast<LoadInst>(MUse->getMemoryInst()); Load->getType.).) {
+          LLVM_DEBUG(dbgs() << "LoadInst: " << *Load << "\n");
+          if (!Load->getType()->isPointerTy())
+            continue;
+          // if (EAI.solveEscapeFor(*Load, ProcessingSet))
+          //   return true;
+          EscapeCaptureTracker LocalTracker(EAI, ProcessingSet);
+          PointerMayBeCaptured(Load, &LocalTracker, WorklistLimit);
+          if (LocalTracker.hasEscaped())
+            return true;
+        }
+      } else if (auto *MPhi = dyn_cast<MemoryPhi>(U)) {
+        if (VisitedMA.insert(MPhi).second)
+          MAWorkList.push_back(MPhi);
+      }
+    }
+  }
+  return false;
+}
+
 CaptureTracker::Action
 EscapeAnalysisInfo::EscapeCaptureTracker::captured(const Use *U,
                                                    UseCaptureInfo CI) {
+  LLVM_DEBUG(dbgs() << "  Analyzing capture use: " << *U->get() << " in "
+                    << *U->getUser() << "\n");
   const auto *I = cast<Instruction>(U->getUser());
 
   // If CaptureTracking says this use does not capture, continue exploring.
@@ -353,6 +399,15 @@ EscapeAnalysisInfo::EscapeCaptureTracker::captured(const Use *U,
         Escaped = true;
         return Stop;
       }
+
+      LLVM_DEBUG(dbgs() << "---- doesStoredPointerEscapeViaLoads ----\n");
+      if (doesStoredPointerEscapeViaLoads(SI, ProcessingSet)) {
+        LLVM_DEBUG(dbgs() << "  Stored to escaping alloca, escapes\n");
+        Escaped = true;
+        LLVM_DEBUG(dbgs() << "-----------------------------------------\n");
+        return Stop;
+      }
+      LLVM_DEBUG(dbgs() << "-----------------------------------------\n");
       LLVM_DEBUG(dbgs() << "    Store to safe local, doesn't escape\n");
       return ContinueIgnoringReturn;
     }
@@ -388,7 +443,14 @@ bool EscapeAnalysisInfo::solveEscapeFor(
     const Value &Allocation,
     SmallPtrSet<const Value *, 32> &ProcessingSet) {
   // Mark this allocation as being processed to prevent infinite recursion
+  LLVM_DEBUG(dbgs() << "====================================\n";
+             dbgs() << "solveEscapeFor " << Allocation << "\n";);
   ProcessingSet.insert(&Allocation);
+
+  // const bool Captured = PointerMayBeCaptured(&Allocation, true);
+  // dbgs() << "CT: Allocation " << Allocation
+  //        << (Captured ? " may be CAPTURED\n" : " NOT CAPTURED\n");
+  // dbgs() << "====================================\n";
 
   // Create our custom tracker
   EscapeCaptureTracker Tracker(*this, ProcessingSet);
@@ -482,13 +544,11 @@ bool EscapeAnalysisInfo::isEscaping(const Value &Alloc) {
 
 void EscapeAnalysisInfo::print(raw_ostream &OS) {
   auto &TLI = FAM.getResult<TargetLibraryAnalysis>(F);
-  LLVM_DEBUG(dbgs() << "Module triple: "
-                    << F.getParent()->getTargetTriple().str() << "\n");
-
   bool Any = false;
   unsigned UnnamedCount = 0;
 
   for (Instruction &I : instructions(F)) {
+    LLVM_DEBUG(OS << "\nI: " << I << "\n");
     if (!isAllocationSite(&I, &TLI))
       continue;
 
