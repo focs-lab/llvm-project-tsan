@@ -62,6 +62,27 @@ private:
 
   MemorySSA *MSSA = nullptr;
   LoopInfo *LI = nullptr;
+  AAResults *AA = nullptr;
+
+  // getUnderlyingObjects(..., MaxLookup = 0) is assumed to mean "unbounded".
+  // If upstream changes semantics, this must be revisited.
+  static const unsigned VTMaxLookup = 0;
+
+  /// Add P to Worklist if it doesn't exist in Seen
+  template <class PtrT, class SetT, class WorklistT>
+  static bool tryEnqueueIfNew(PtrT *P, SetT &Seen, WorklistT &Worklist);
+
+  /// Try to use ValueTracking to find underlying objects.
+  static bool tryValueTracking(const Value *V, LoopInfo *LI,
+                               SmallVectorImpl<const Value *> &Work,
+                               SmallPtrSetImpl<const Value *> &Enqueued);
+
+  /// Add incoming unvisited MemoryAccesses of a MemoryPhi to MAWorkList.
+  static void appendIncomingMAs(const MemoryPhi *MPhi,
+                                SmallPtrSetImpl<MemoryAccess *> &VisitedMA,
+                                SmallVectorImpl<MemoryAccess *> &MAWorkList,
+                                MemoryLocation Loc, MemorySSAWalker *Walker);
+  bool isNonAtomicNonVolatile(const Value *V);
 
   ///===- GetUnderlyingObjectsThroughLoads
   ///---------------------------------===//
@@ -70,8 +91,9 @@ private:
   /// to chase defining writes and, when possible, look through loads. This is
   /// more precise (and potentially more expensive) than plain ValueTracking.
   ///
-  /// \param V        A pointer-typed value to analyze.
+  /// \param Ptr        A pointer-typed value to analyze.
   /// \param MSSA     A valid, up-to-date MemorySSA for V. Must not be null.
+  /// \param AA
   /// \param Result   Output set that will be populated with the results.
   ///                 The set is not cleared; new elements are inserted into it.
   /// \param LI       Optional LoopInfo used to improve reasoning about PHIs in
@@ -104,9 +126,12 @@ private:
   ///    analysis can conservatively identify, not a single precise source.
   ///
   static void getUnderlyingObjectsThroughLoads(
-      const Value *V, MemorySSA *MSSA, SmallPtrSetImpl<const Value *> &Result,
-      LoopInfo *LI = nullptr, bool *IsComplete = nullptr,
-      unsigned MaxSteps = 10000);
+      const Value *Ptr, MemorySSA *MSSA, AAResults *AA,
+      SmallPtrSetImpl<const Value *> &Result, LoopInfo *LI = nullptr,
+      bool *IsComplete = nullptr, unsigned MaxSteps = 10000);
+
+  /// Checks whether a base location is externally visible (thus escapes).
+  static bool isExternalObject(const Value *Base);
 
   /// Custom CaptureTracker for escape analysis
   class EscapeCaptureTracker : public CaptureTracker {
@@ -134,7 +159,7 @@ private:
   };
 
   /// Solve escape for a single allocation site using backward dataflow.
-  bool solveEscapeFor(const Value &Allocation,
+  bool solveEscapeFor(const Value &Alloca,
                       SmallPtrSet<const Value *, 32> &ProcessingSet);
 
   // Helper function to detect heap allocations.

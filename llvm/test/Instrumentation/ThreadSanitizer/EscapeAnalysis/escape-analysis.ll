@@ -10,6 +10,7 @@
 target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64-S128"
 
 @G = global ptr null
+@GPtr = dso_local global ptr null, align 8
 
 declare noalias ptr @malloc(i64)
 declare noalias ptr @external(i64)
@@ -156,5 +157,35 @@ define void @store_to_unknown_ret_escape() {
   %a = alloca i8, align 1
   %p = call ptr @external(i64 16)
   store ptr %a, ptr %p
+  ret void
+}
+
+; ----------------------------------------
+; Escape through pointer loaded from local alloca and stored to global -> escape
+; ----------------------------------------
+define dso_local void @escape_through_pointer1() {
+; CHECK-LABEL: Printing analysis 'Escape Analysis' for function 'escape_through_pointer1':
+; CHECK: x escapes: yes
+; CHECK: p escapes: no
+  %x = alloca i32, align 4
+  %p = alloca ptr, align 8
+  store ptr %x, ptr %p, align 8
+  %1 = load ptr, ptr %p, align 8
+  store ptr %1, ptr @GPtr, align 8
+  ret void
+}
+
+; ----------------------------------------
+; Escape when a pointer from global overwrites a local pointer containing x (conservative) -> escape
+; ----------------------------------------
+define dso_local void @escape_through_pointer2() #0 {
+; CHECK-LABEL: Printing analysis 'Escape Analysis' for function 'escape_through_pointer2':
+; CHECK: x escapes: yes
+; CHECK: p escapes: no
+  %x = alloca i32, align 4
+  %p = alloca ptr, align 8
+  store ptr %x, ptr %p, align 8
+  %1 = load ptr, ptr @GPtr, align 8
+  store ptr %1, ptr %p, align 8
   ret void
 }
