@@ -151,11 +151,10 @@ private:
     bool Escaped = false;
 
     /// Analyze if storing to destination causes escape
-    bool doesStoreDestinationEscape(const Value *Dest);
+    bool doesStoreSrcOrDestEscapes(const Value *Dest);
 
     /// Analyze whether the pointer value stored by `Store` can escape
-    bool doesStoredPointerEscapeViaLoads(
-        const StoreInst *Store, SmallPtrSet<const Value *, 32> &ProcessingSet);
+    bool doesStoredPointerEscapeViaLoads(const StoreInst *Store);
   };
 
   /// Solve escape for a single allocation site using backward dataflow.

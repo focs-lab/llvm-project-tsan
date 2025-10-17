@@ -89,6 +89,8 @@ void EscapeAnalysisInfo::getUnderlyingObjectsThroughLoads(
     const Value *Ptr, MemorySSA *MSSA, AAResults *AA,
     SmallPtrSetImpl<const Value *> &Result, LoopInfo *LI, bool *IsComplete,
     unsigned MaxSteps) {
+  LLVM_DEBUG(dbgs() << "getUnderlyingObjectsThroughLoads: " << *Ptr << "\n");
+
   assert(MSSA && "MemorySSA is required for this analysis");
   MemorySSAWalker *Walker = MSSA->getWalker();
 
@@ -106,8 +108,7 @@ void EscapeAnalysisInfo::getUnderlyingObjectsThroughLoads(
                         isa<GlobalAlias>(Term) || isa<Argument>(Term) ||
                         isa<ConstantPointerNull>(Term);
     LLVM_DEBUG(dbgs() << "Mark terminal: " << *Term << " IsBase="
-                      << (IsBase ? "yes" : "no") << " ForceIncompleteIfNotBase="
-                      << (MarkIncompleteIfNotBase ? "yes" : "no") << "\n");
+                      << (IsBase ? "yes" : "no") << "\n");
     Result.insert(Term);
     if (IsComplete && !IsBase && MarkIncompleteIfNotBase)
       *IsComplete = false;
@@ -125,7 +126,6 @@ void EscapeAnalysisInfo::getUnderlyingObjectsThroughLoads(
   };
 
   tryEnqueueIfNew(Ptr, Seen, Worklist);
-  LLVM_DEBUG(dbgs() << "Seed: " << *Ptr << " MaxSteps=" << MaxSteps << "\n");
 
   unsigned Step = 0;
   if (IsComplete)
@@ -263,8 +263,9 @@ bool EscapeAnalysisInfo::isExternalObject(const Value *Base) {
          isa<Argument>(Base);
 }
 
-bool EscapeAnalysisInfo::EscapeCaptureTracker::doesStoreDestinationEscape(
+bool EscapeAnalysisInfo::EscapeCaptureTracker::doesStoreSrcOrDestEscapes(
     const Value *Dest) {
+  LLVM_DEBUG(dbgs() << "  Analyzing store destination: " << *Dest << "\n");
   // Find base objects for the storage location
   SmallPtrSet<const Value *, 8> BaseObjects;
   bool IsComplete = false;
@@ -288,8 +289,18 @@ bool EscapeAnalysisInfo::EscapeCaptureTracker::doesStoreDestinationEscape(
       // Cycle in the current recursion indicates incomplete local reasoning.
       // Without a global fixpoint, treat as escape to remain conservative.
       if (ProcessingSet.count(Alloca)) {
-        LLVM_DEBUG(dbgs() << "  Cyclic store dependency, escapes\n");
-        return true;
+        LLVM_DEBUG(dbgs() << Alloca->getName() << " is processing now, skip\n");
+        continue;
+        // LLVM_DEBUG(dbgs() << "  Cyclic store dependency, escapes\n");
+        // LLVM_DEBUG({
+        //   dbgs() << "    Alloca involved in cycle: " << *Alloca << "\n";
+        //   dbgs() << "    ProcessingSet size=" << ProcessingSet.size() << "\n";
+        //   dbgs() << "    ProcessingSet contents:\n";
+        //   for (const Value *V : ProcessingSet) {
+        //     dbgs() << "      - " << *V << "\n";
+        //   }
+        // });
+        // return true;
       }
 
       // Recurse to decide whether the target alloca itself escapes.
@@ -310,7 +321,7 @@ bool EscapeAnalysisInfo::EscapeCaptureTracker::doesStoreDestinationEscape(
 }
 
 bool EscapeAnalysisInfo::EscapeCaptureTracker::doesStoredPointerEscapeViaLoads(
-    const StoreInst *Store, SmallPtrSet<const Value *, 32> &ProcessingSet) {
+    const StoreInst *Store) {
   if (!EAI.MSSA) return true;
   auto *StartMDef = dyn_cast<MemoryDef>(EAI.MSSA->getMemoryAccess(Store));
   if (!StartMDef) return true;
@@ -320,42 +331,28 @@ bool EscapeAnalysisInfo::EscapeCaptureTracker::doesStoredPointerEscapeViaLoads(
   MAWorkList.push_back(StartMDef);
   VisitedMA.insert(StartMDef);
 
-  MemorySSAWalker *Walker = EAI.MSSA->getWalker();
-
   unsigned Steps = 0;
   while (!MAWorkList.empty()) {
     if (++Steps > WorklistLimit) return true;
     MemoryAccess *MA = MAWorkList.pop_back_val();
 
     for (User *U : MA->users()) {
-      if (auto *MUse = dyn_cast<MemoryUse>(U)) {
-        LLVM_DEBUG(dbgs() << "I: " << *MUse->getMemoryInst()
-                          << "\tMemoryUse: " << *MUse << "\n");
-        if (Walker->getClobberingMemoryAccess(MUse) != MA)
-          continue;
-
-        if (const auto *Load = dyn_cast<LoadInst>(MUse->getMemoryInst());
-            Load && Load->getType()->isPointerTy()) {
-          LLVM_DEBUG(dbgs() << "LoadInst: " << *Load << "\n");
-          // if (EAI.solveEscapeFor(*Load, ProcessingSet))
-          //   return true;
-          EscapeCaptureTracker LocalTracker(EAI, ProcessingSet);
-          PointerMayBeCaptured(Load, &LocalTracker, WorklistLimit);
-          if (LocalTracker.hasEscaped())
-            return true;
-        }
-      } else if (const auto *MDef = dyn_cast<MemoryDef>(U)) {
+      if (const auto *MDef = dyn_cast<MemoryDef>(U)) {
         LLVM_DEBUG(dbgs() << "I: " << *MDef->getMemoryInst()
                           << "\tMemoryDef: " << *MDef << "\n");
+        // Check whether we store an external pointer to our pointer
         if (auto *StoreToPtr = dyn_cast<StoreInst>(MDef->getMemoryInst())) {
           if (StoreToPtr->getValueOperand()->getType()->isPointerTy()) {
-            LLVM_DEBUG(dbgs() << "StoreInst: " << *StoreToPtr << "\n");
+            LLVM_DEBUG(dbgs() << ">>>> StoreInst: " << *StoreToPtr << "\n");
             LLVM_DEBUG(dbgs() << "\tEscape: " << *StoreToPtr->getValueOperand()
                               << "\n");
-            if (doesStoreDestinationEscape(StoreToPtr->getValueOperand())) {
-              LLVM_DEBUG(
-                  dbgs()
-                  << "  Store escaping source to the pointer, escapes\n");
+            if (doesStoreSrcOrDestEscapes(StoreToPtr->getValueOperand())) {
+              LLVM_DEBUG(dbgs() << "Store from escaping object, escape\n");
+              Escaped = true;
+              return Stop;
+            }
+            if (doesStoreSrcOrDestEscapes(StoreToPtr->getPointerOperand())) {
+              LLVM_DEBUG(dbgs() << "Store to escaping object, escape\n");
               Escaped = true;
               return Stop;
             }
@@ -398,21 +395,22 @@ EscapeAnalysisInfo::EscapeCaptureTracker::captured(const Use *U,
     if (Store->getValueOperand() == U->get()) {
       LLVM_DEBUG(dbgs() << "    Storing pointer value, analyze destination\n");
       if (Store->isVolatile() || Store->isAtomic() ||
-          doesStoreDestinationEscape(Store->getPointerOperand())) {
+          doesStoreSrcOrDestEscapes(Store->getPointerOperand())) {
         LLVM_DEBUG(dbgs() << "  Store to escaping destination, escapes\n");
         Escaped = true;
         return Stop;
       }
 
-      LLVM_DEBUG(dbgs() << "---- doesStoredPointerEscapeViaLoads ----\n");
-      if (doesStoredPointerEscapeViaLoads(Store, ProcessingSet)) {
+      LLVM_DEBUG(dbgs() << "\n---- doesStoredPointerEscapeViaLoads ----\n");
+      if (doesStoredPointerEscapeViaLoads(Store)) {
         LLVM_DEBUG(dbgs() << "  Stored to escaping alloca, escapes\n");
         Escaped = true;
         LLVM_DEBUG(dbgs() << "-----------------------------------------\n");
+        LLVM_DEBUG(dbgs() << "    Store to external, escape\n\n");
         return Stop;
       }
       LLVM_DEBUG(dbgs() << "-----------------------------------------\n");
-      LLVM_DEBUG(dbgs() << "    Store to safe local, doesn't escape\n");
+      LLVM_DEBUG(dbgs() << "    Store to safe local, doesn't escape\n\n");
       return ContinueIgnoringReturn;
     }
     // If we are the destination pointer, this use does not capture the value.

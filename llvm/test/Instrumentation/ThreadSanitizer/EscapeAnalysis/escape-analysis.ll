@@ -134,8 +134,7 @@ define void @malloc_local_no_escape() {
 }
 
 ; ----------------------------------------
-; Cyclic dependency between local allocas -> conservative escape
-; a <-> b cycle through stores
+; Cyclic dependency between local allocas, one stored to global -> both escape
 ; ----------------------------------------
 define void @cycle_allocas_escape() {
 ; CHECK-LABEL: Printing analysis 'Escape Analysis' for function 'cycle_allocas_escape':
@@ -145,6 +144,7 @@ define void @cycle_allocas_escape() {
   %b = alloca ptr, align 8
   store ptr %a, ptr %b
   store ptr %b, ptr %a
+  store ptr %a, ptr @G
   ret void
 }
 
