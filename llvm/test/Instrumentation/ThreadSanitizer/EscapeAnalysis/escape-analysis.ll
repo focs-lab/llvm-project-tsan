@@ -20,6 +20,10 @@ target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f3
 declare noalias ptr @malloc(i64)
 declare noalias ptr @external(ptr)
 
+; ============================================================================ ;
+; Basics \+ locals
+; ============================================================================ ;
+
 ; ----------------------------------------
 ; No allocations
 ; ----------------------------------------
@@ -40,6 +44,53 @@ define void @local_alloc_no_escape() {
 }
 
 ; ----------------------------------------
+; Using pointer in icmp -> no escape
+; ----------------------------------------
+define void @icmp_no_escape() {
+; CHECK-LABEL: Printing analysis 'Escape Analysis' for function 'icmp_no_escape':
+; CHECK: a escapes: no
+  %a = alloca i8, align 1
+  %cmp = icmp eq ptr %a, null
+  ret void
+}
+
+; ----------------------------------------
+; Passthrough via phi/select-like -> no escape
+; ----------------------------------------
+define void @passthrough_phi_no_escape(i1 %c) {
+; CHECK-LABEL: Printing analysis 'Escape Analysis' for function 'passthrough_phi_no_escape':
+; CHECK: a escapes: no
+entry:
+  %a = alloca i8, align 1
+  br i1 %c, label %t, label %f
+t:
+  br label %merge
+f:
+  br label %merge
+merge:
+  %p = phi ptr [ %a, %t ], [ %a, %f ]
+  ret void
+}
+
+; ----------------------------------------
+; Safe store to local memory -> no escape
+; Also checks we print both allocas
+; ----------------------------------------
+define void @store_to_local_ok() {
+; CHECK-LABEL: Printing analysis 'Escape Analysis' for function 'store_to_local_ok':
+; CHECK: a escapes: no
+; CHECK: p escapes: no
+  %a = alloca i8, align 1
+  %p = alloca ptr, align 8
+  store ptr %a, ptr %p
+  ret void
+}
+
+; ============================================================================ ;
+; Returns and heap allocations
+; ============================================================================ ;
+
+; ----------------------------------------
 ; Returning alloca pointer -> escape
 ; ----------------------------------------
 define ptr @return_alloca_escape() {
@@ -48,6 +99,22 @@ define ptr @return_alloca_escape() {
   %a = alloca i8, align 1
   ret ptr %a
 }
+
+; ----------------------------------------
+; Malloc-like allocations
+; ----------------------------------------
+define ptr @malloc_local_no_escape() {
+; CHECK-LABEL: Printing analysis 'Escape Analysis' for function 'malloc_local_no_escape':
+; CHECK: m1 escapes: no
+; CHECK: m2 escapes: yes
+  %m1 = call ptr @malloc(i64 16)
+  %m2 = call ptr @malloc(i64 32)
+  ret ptr %m2
+}
+
+; ============================================================================ ;
+; Globals, arguments, and mixed destinations
+; ============================================================================ ;
 
 ; ----------------------------------------
 ; Store to global, global alias -> escape
@@ -75,84 +142,17 @@ define void @store_to_arg_escape(ptr %out) {
 }
 
 ; ----------------------------------------
-; Atomic store of pointer -> treated as escape
+; Store to the pointer, returned by an external function -> escape
 ; ----------------------------------------
-define void @atomic_store_escape() {
-; CHECK-LABEL: Printing analysis 'Escape Analysis' for function 'atomic_store_escape':
+define void @store_to_unknown_ret_escape() {
+; CHECK-LABEL: Printing analysis 'Escape Analysis' for function 'store_to_unknown_ret_escape':
 ; CHECK: a escapes: yes
-; CHECK: p escapes: no
+; CHECK: b escapes: yes
   %a = alloca i8, align 1
-  %p = alloca ptr, align 8
-  store atomic ptr %a, ptr %p seq_cst, align 8
-  ret void
-}
-
-; ----------------------------------------
-; Safe store to local memory -> no escape
-; Also checks we print both allocas
-; ----------------------------------------
-define void @store_to_local_ok() {
-; CHECK-LABEL: Printing analysis 'Escape Analysis' for function 'store_to_local_ok':
-; CHECK: a escapes: no
-; CHECK: p escapes: no
-  %a = alloca i8, align 1
-  %p = alloca ptr, align 8
+  %b = alloca i8, align 1
+  %p = call ptr @external(ptr %b)
   store ptr %a, ptr %p
   ret void
-}
-
-; ----------------------------------------
-; Passthrough via phi/select-like -> no escape
-; ----------------------------------------
-define void @passthrough_phi_no_escape(i1 %c) {
-; CHECK-LABEL: Printing analysis 'Escape Analysis' for function 'passthrough_phi_no_escape':
-; CHECK: a escapes: no
-entry:
-  %a = alloca i8, align 1
-  br i1 %c, label %t, label %f
-t:
-  br label %merge
-f:
-  br label %merge
-merge:
-  %p = phi ptr [ %a, %t ], [ %a, %f ]
-  ret void
-}
-
-; ----------------------------------------
-; Using pointer in icmp -> no escape
-; ----------------------------------------
-define void @icmp_no_escape() {
-; CHECK-LABEL: Printing analysis 'Escape Analysis' for function 'icmp_no_escape':
-; CHECK: a escapes: no
-  %a = alloca i8, align 1
-  %cmp = icmp eq ptr %a, null
-  ret void
-}
-
-; ----------------------------------------
-; Volatile store of pointer -> treated as escape
-; ----------------------------------------
-define void @volatile_store_escape() {
-; CHECK-LABEL: Printing analysis 'Escape Analysis' for function 'volatile_store_escape':
-; CHECK: a escapes: yes
-; CHECK: p escapes: no
-  %a = alloca i8, align 1
-  %p = alloca ptr, align 8
-  store volatile ptr %a, ptr %p
-  ret void
-}
-
-; ----------------------------------------
-; Malloc-like allocations
-; ----------------------------------------
-define ptr @malloc_local_no_escape() {
-; CHECK-LABEL: Printing analysis 'Escape Analysis' for function 'malloc_local_no_escape':
-; CHECK: m1 escapes: no
-; CHECK: m2 escapes: yes
-  %m1 = call ptr @malloc(i64 16)
-  %m2 = call ptr @malloc(i64 32)
-  ret ptr %m2
 }
 
 ; ----------------------------------------
@@ -171,16 +171,22 @@ define void @cycle_allocas_escape() {
 }
 
 ; ----------------------------------------
-; Store to the pointer, returned by an external function -> escape
+; Destination via phi mixing local and global -> escape
 ; ----------------------------------------
-define void @store_to_unknown_ret_escape() {
-; CHECK-LABEL: Printing analysis 'Escape Analysis' for function 'store_to_unknown_ret_escape':
+define void @phi_mixed_dest_escape(i1 %c) {
+; CHECK-LABEL: Printing analysis 'Escape Analysis' for function 'phi_mixed_dest_escape':
 ; CHECK: a escapes: yes
-; CHECK: b escapes: yes
+; CHECK: p escapes: no
   %a = alloca i8, align 1
-  %b = alloca i8, align 1
-  %p = call ptr @external(ptr %b)
-  store ptr %a, ptr %p
+  %p = alloca ptr, align 8
+  br i1 %c, label %t, label %f
+t:
+  br label %m
+f:
+  br label %m
+m:
+  %dst = phi ptr [ %p, %t ], [ @GPtr, %f ]
+  store ptr %a, ptr %dst, align 8
   ret void
 }
 
@@ -214,6 +220,10 @@ define dso_local void @store_ptr_store_from_global_no_escape() {
   ret void
 }
 
+; ============================================================================ ;
+; Loaded destination patterns
+; ============================================================================ ;
+
 ; ----------------------------------------
 ; Store through pointer loaded from argument (LiveOnEntry) -> escape
 ; ----------------------------------------
@@ -223,40 +233,6 @@ define void @store_through_loaded_arg_escape(ptr %out) {
   %a = alloca i8, align 1
   %l = load ptr, ptr %out, align 8
   store ptr %a, ptr %l, align 8
-  ret void
-}
-
-; ----------------------------------------
-; Store to local array element via GEP -> no escape
-; ----------------------------------------
-define void @store_to_gep_local_ok() {
-; CHECK-LABEL: Printing analysis 'Escape Analysis' for function 'store_to_gep_local_ok':
-; CHECK: a escapes: no
-; CHECK: arr escapes: no
-  %a = alloca i8, align 1
-  %arr = alloca [2 x ptr], align 8
-  %elem = getelementptr inbounds [2 x ptr], ptr %arr, i64 0, i64 1
-  store ptr %a, ptr %elem, align 8
-  ret void
-}
-
-; ----------------------------------------
-; Destination via phi mixing local and global -> escape
-; ----------------------------------------
-define void @phi_mixed_dest_escape(i1 %c) {
-; CHECK-LABEL: Printing analysis 'Escape Analysis' for function 'phi_mixed_dest_escape':
-; CHECK: a escapes: yes
-; CHECK: p escapes: no
-  %a = alloca i8, align 1
-  %p = alloca ptr, align 8
-  br i1 %c, label %t, label %f
-t:
-  br label %m
-f:
-  br label %m
-m:
-  %dst = phi ptr [ %p, %t ], [ @GPtr, %f ]
-  store ptr %a, ptr %dst, align 8
   ret void
 }
 
@@ -287,19 +263,27 @@ m:
   ret void
 }
 
+; ============================================================================ ;
+; Arrays and GEP
+; ============================================================================ ;
+
 ; ----------------------------------------
-; PtrToInt cast -> escape
+; Store to local array element via GEP -> no escape
 ; ----------------------------------------
-define void @worklist_limit_bailout() {
-; CHECK-LABEL: Printing analysis 'Escape Analysis' for function 'worklist_limit_bailout':
-; CHECK: a escapes: yes
+define void @store_to_gep_local_ok() {
+; CHECK-LABEL: Printing analysis 'Escape Analysis' for function 'store_to_gep_local_ok':
+; CHECK: a escapes: no
+; CHECK: arr escapes: no
   %a = alloca i8, align 1
-  %c1 = icmp ne ptr %a, null
-  %c2 = icmp eq ptr %a, null
-  %sel = select i1 %c1, ptr %a, ptr %a
-  %use = ptrtoint ptr %sel to i64
+  %arr = alloca [2 x ptr], align 8
+  %elem = getelementptr inbounds [2 x ptr], ptr %arr, i64 0, i64 1
+  store ptr %a, ptr %elem, align 8
   ret void
 }
+
+; ============================================================================ ;
+; Structs and struct fields
+; ============================================================================ ;
 
 ; ----------------------------------------
 ; Store into field of a local struct -> no escape
@@ -402,4 +386,52 @@ define %S @return_struct_containing_ptr_escape() {
   %u = insertvalue %S undef, ptr %x, 0
   %u2 = insertvalue %S %u, ptr null, 1
   ret %S %u2
+}
+
+; ============================================================================ ;
+; Atomics and volatile
+; ============================================================================ ;
+
+; ----------------------------------------
+; Atomic store of pointer -> treated as escape
+; ----------------------------------------
+define void @atomic_store_escape() {
+; CHECK-LABEL: Printing analysis 'Escape Analysis' for function 'atomic_store_escape':
+; CHECK: a escapes: yes
+; CHECK: p escapes: no
+  %a = alloca i8, align 1
+  %p = alloca ptr, align 8
+  store atomic ptr %a, ptr %p seq_cst, align 8
+  ret void
+}
+
+; ----------------------------------------
+; Volatile store of pointer -> treated as escape
+; ----------------------------------------
+define void @volatile_store_escape() {
+; CHECK-LABEL: Printing analysis 'Escape Analysis' for function 'volatile_store_escape':
+; CHECK: a escapes: yes
+; CHECK: p escapes: no
+  %a = alloca i8, align 1
+  %p = alloca ptr, align 8
+  store volatile ptr %a, ptr %p
+  ret void
+}
+
+; ============================================================================ ;
+; Casts
+; ============================================================================ ;
+
+; ----------------------------------------
+; PtrToInt cast -> escape
+; ----------------------------------------
+define void @worklist_limit_bailout() {
+; CHECK-LABEL: Printing analysis 'Escape Analysis' for function 'worklist_limit_bailout':
+; CHECK: a escapes: yes
+  %a = alloca i8, align 1
+  %c1 = icmp ne ptr %a, null
+  %c2 = icmp eq ptr %a, null
+  %sel = select i1 %c1, ptr %a, ptr %a
+  %use = ptrtoint ptr %sel to i64
+  ret void
 }
