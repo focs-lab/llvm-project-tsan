@@ -340,17 +340,12 @@ bool EscapeAnalysisInfo::EscapeCaptureTracker::doesStoredPointerEscapeViaLoads(
       if (const auto *MDef = dyn_cast<MemoryDef>(U)) {
         LLVM_DEBUG(dbgs() << "I: " << *MDef->getMemoryInst()
                           << "\tMemoryDef: " << *MDef << "\n");
-        // Check whether we store an external pointer to our pointer
         if (auto *StoreToPtr = dyn_cast<StoreInst>(MDef->getMemoryInst())) {
           if (StoreToPtr->getValueOperand()->getType()->isPointerTy()) {
             LLVM_DEBUG(dbgs() << ">>>> StoreInst: " << *StoreToPtr << "\n");
             LLVM_DEBUG(dbgs() << "\tEscape: " << *StoreToPtr->getValueOperand()
                               << "\n");
-            if (doesStoreSrcOrDestEscapes(StoreToPtr->getValueOperand())) {
-              LLVM_DEBUG(dbgs() << "Store from escaping object, escape\n");
-              Escaped = true;
-              return Stop;
-            }
+            // Check whether we store the pointer to an external pointer
             if (doesStoreSrcOrDestEscapes(StoreToPtr->getPointerOperand())) {
               LLVM_DEBUG(dbgs() << "Store to escaping object, escape\n");
               Escaped = true;
@@ -537,8 +532,7 @@ bool EscapeAnalysisInfo::isEscaping(const Value &Alloc) {
   if (IsEscaped)
     NumAllocationsEscaped++;
 
-  // 4. Store result in cache and return
-  return Cache[(&Alloc)] = IsEscaped;
+  return IsEscaped;
 }
 
 void EscapeAnalysisInfo::print(raw_ostream &OS) {
