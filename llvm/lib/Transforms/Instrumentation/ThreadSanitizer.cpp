@@ -41,6 +41,7 @@
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Transforms/Instrumentation/EscapeAnalysis.h"
 #include "llvm/Transforms/Utils/EscapeEnumerator.h"
 #include "llvm/Transforms/Utils/Instrumentation.h"
 #include "llvm/Transforms/Utils/Local.h"
@@ -84,6 +85,11 @@ static cl::opt<bool>
     ClOmitNonCaptured("tsan-omit-by-pointer-capturing", cl::init(true),
                       cl::desc("Omit accesses due to pointer capturing"),
                       cl::Hidden);
+static cl::opt<bool> ClUseEscapeAnalysisInTSan(
+    "tsan-enable-escape-analysis", cl::init(false),
+    cl::desc("Use EscapeAnalysis to filter memory accesses to non-escaping "
+             "objects"),
+    cl::Hidden);
 
 STATISTIC(NumInstrumentedReads, "Number of instrumented reads");
 STATISTIC(NumInstrumentedWrites, "Number of instrumented writes");
@@ -96,6 +102,8 @@ STATISTIC(NumOmittedReadsFromConstantGlobals,
           "Number of reads from constant globals");
 STATISTIC(NumOmittedReadsFromVtable, "Number of vtable reads");
 STATISTIC(NumOmittedNonCaptured, "Number of accesses ignored due to capturing");
+STATISTIC(NumOmittedByEscapeAnalysis,
+          "Number of accesses ignored due to EscapeAnalysis");
 
 const char kTsanModuleCtorName[] = "tsan.module_ctor";
 const char kTsanInitName[] = "__tsan_init";
@@ -118,7 +126,7 @@ struct ThreadSanitizer {
     }
   }
 
-  bool sanitizeFunction(Function &F, const TargetLibraryInfo &TLI);
+  bool sanitizeFunction(Function &F, FunctionAnalysisManager *FAM);
 
 private:
   // Internal Instruction wrapper that contains more information about the
@@ -140,7 +148,8 @@ private:
   bool instrumentMemIntrinsic(Instruction *I);
   void chooseInstructionsToInstrument(SmallVectorImpl<Instruction *> &Local,
                                       SmallVectorImpl<InstructionInfo> &All,
-                                      const DataLayout &DL);
+                                      const DataLayout &DL,
+                                      FunctionAnalysisManager *FAM);
   bool addrPointsToConstantData(Value *Addr);
   int getMemoryAccessFuncIndex(Type *OrigTy, Value *Addr, const DataLayout &DL);
   void InsertRuntimeIgnores(Function &F);
@@ -187,7 +196,7 @@ void insertModuleCtor(Module &M) {
 PreservedAnalyses ThreadSanitizerPass::run(Function &F,
                                            FunctionAnalysisManager &FAM) {
   ThreadSanitizer TSan;
-  if (TSan.sanitizeFunction(F, FAM.getResult<TargetLibraryAnalysis>(F)))
+  if (TSan.sanitizeFunction(F, &FAM))
     return PreservedAnalyses::none();
   return PreservedAnalyses::all();
 }
@@ -200,6 +209,7 @@ PreservedAnalyses ModuleThreadSanitizerPass::run(Module &M,
   insertModuleCtor(M);
   return PreservedAnalyses::none();
 }
+
 void ThreadSanitizer::initialize(Module &M, const TargetLibraryInfo &TLI) {
   const DataLayout &DL = M.getDataLayout();
   LLVMContext &Ctx = M.getContext();
@@ -407,6 +417,7 @@ bool ThreadSanitizer::addrPointsToConstantData(Value *Addr) {
 // Currently handled:
 //  - read-before-write (within same BB, no calls between)
 //  - not captured variables
+//  - non-escaping allocations (if -tsan-use-escape-analysis)
 //
 // We do not handle some of the patterns that should not survive
 // after the classic compiler optimizations.
@@ -417,7 +428,8 @@ bool ThreadSanitizer::addrPointsToConstantData(Value *Addr) {
 // 'All' is a vector of insns that will be instrumented.
 void ThreadSanitizer::chooseInstructionsToInstrument(
     SmallVectorImpl<Instruction *> &Local,
-    SmallVectorImpl<InstructionInfo> &All, const DataLayout &DL) {
+    SmallVectorImpl<InstructionInfo> &All, const DataLayout &DL,
+    FunctionAnalysisManager *FAM) {
   DenseMap<Value *, size_t> WriteTargets; // Map of addresses to index in All
   // Iterate from the end.
   for (Instruction *I : reverse(Local)) {
@@ -463,6 +475,15 @@ void ThreadSanitizer::chooseInstructionsToInstrument(
       continue;
     }
 
+    // Use escape analysis if enabled
+    if (AI && ClUseEscapeAnalysisInTSan) {
+      if (auto &EAInfo = FAM->getResult<EscapeAnalysis>(*I->getFunction());
+          !EAInfo.isEscaping(*AI)) {
+        NumOmittedByEscapeAnalysis++;
+        continue;
+      }
+    }
+
     // Instrument this instruction.
     All.emplace_back(I);
     if (IsWrite) {
@@ -496,7 +517,7 @@ void ThreadSanitizer::InsertRuntimeIgnores(Function &F) {
 }
 
 bool ThreadSanitizer::sanitizeFunction(Function &F,
-                                       const TargetLibraryInfo &TLI) {
+                                       FunctionAnalysisManager *FAM) {
   // This is required to prevent instrumenting call to __tsan_init from within
   // the module constructor.
   if (F.getName() == kTsanModuleCtorName)
@@ -512,7 +533,7 @@ bool ThreadSanitizer::sanitizeFunction(Function &F,
   if (F.hasFnAttribute(Attribute::DisableSanitizerInstrumentation))
     return false;
 
-  initialize(*F.getParent(), TLI);
+  initialize(*F.getParent(), FAM->getResult<TargetLibraryAnalysis>(F));
   SmallVector<InstructionInfo, 8> AllLoadsAndStores;
   SmallVector<Instruction*, 8> LocalLoadsAndStores;
   SmallVector<Instruction*, 8> AtomicAccesses;
@@ -539,10 +560,11 @@ bool ThreadSanitizer::sanitizeFunction(Function &F,
           MemIntrinCalls.push_back(&Inst);
         HasCalls = true;
         chooseInstructionsToInstrument(LocalLoadsAndStores, AllLoadsAndStores,
-                                       DL);
+                                       DL, FAM);
       }
     }
-    chooseInstructionsToInstrument(LocalLoadsAndStores, AllLoadsAndStores, DL);
+    chooseInstructionsToInstrument(LocalLoadsAndStores, AllLoadsAndStores, DL,
+                                   FAM);
   }
 
   // We have collected all loads and stores.
