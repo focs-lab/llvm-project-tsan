@@ -18,6 +18,7 @@ endif()
 set(TSAN_DYNAMIC_TEST_DEPS ${TSAN_TEST_DEPS})
 set(TSAN_TESTSUITES)
 set(TSAN_DYNAMIC_TESTSUITES)
+set(TSAN_ENABLE_ESCAPE_ANALYSIS "False") # Disable escape analysis by default
 
 if (NOT DEFINED TSAN_TEST_DEFLAKE_THRESHOLD)
   set(TSAN_TEST_DEFLAKE_THRESHOLD "10")
@@ -136,3 +137,55 @@ if(COMPILER_RT_TSAN_HAS_STATIC_RUNTIME)
                     EXCLUDE_FROM_CHECK_ALL
                     DEPENDS ${TSAN_DYNAMIC_TEST_DEPS})
 endif()
+
+# -----------------------------------------------------------------------------
+# New target: check-tsan-escape-analysis
+# Reuse the same test directories but generate configs with enabled flag.
+set(TSAN_EA_TESTSUITES)
+foreach (arch ${TSAN_TEST_ARCH})
+  # Enable escape analysis flag
+  set(TSAN_ENABLE_ESCAPE_ANALYSIS "True")
+
+  set(TSAN_TEST_APPLE_PLATFORM "osx")
+  set(TSAN_TEST_MIN_DEPLOYMENT_TARGET_FLAG "${DARWIN_osx_MIN_VER_FLAG}")
+
+  set(TSAN_TEST_TARGET_ARCH ${arch})
+  string(TOLOWER "-${arch}-escape" TSAN_TEST_CONFIG_SUFFIX)
+  get_test_cc_for_arch(${arch} TSAN_TEST_TARGET_CC TSAN_TEST_TARGET_CFLAGS)
+
+  string(REPLACE ";" " " LIBDISPATCH_CFLAGS_STRING " ${COMPILER_RT_TEST_LIBDISPATCH_CFLAGS}")
+  string(APPEND TSAN_TEST_TARGET_CFLAGS ${LIBDISPATCH_CFLAGS_STRING})
+
+  if (COMPILER_RT_HAS_MSSE4_2_FLAG)
+    string(APPEND TSAN_TEST_TARGET_CFLAGS " -msse4.2 ")
+  endif ()
+
+  string(TOUPPER ${arch} ARCH_UPPER_CASE)
+  set(CONFIG_NAME ${ARCH_UPPER_CASE}ConfigEscape)
+
+  configure_lit_site_cfg(
+    ${CMAKE_CURRENT_SOURCE_DIR}/lit.site.cfg.py.in
+    ${CMAKE_CURRENT_BINARY_DIR}/${CONFIG_NAME}/lit.site.cfg.py
+    MAIN_CONFIG
+    ${CMAKE_CURRENT_SOURCE_DIR}/lit.cfg.py
+  )
+  list(APPEND TSAN_EA_TESTSUITES ${CMAKE_CURRENT_BINARY_DIR}/${CONFIG_NAME})
+
+  if(COMPILER_RT_TSAN_HAS_STATIC_RUNTIME)
+    string(TOLOWER "-${arch}-${OS_NAME}-dynamic-escape" TSAN_TEST_CONFIG_SUFFIX)
+    set(CONFIG_NAME ${ARCH_UPPER_CASE}${OS_NAME}DynamicConfigEscape)
+    configure_lit_site_cfg(
+      ${CMAKE_CURRENT_SOURCE_DIR}/lit.site.cfg.py.in
+      ${CMAKE_CURRENT_BINARY_DIR}/${CONFIG_NAME}/lit.site.cfg.py
+      MAIN_CONFIG
+      ${CMAKE_CURRENT_SOURCE_DIR}/lit.cfg.py
+    )
+    list(APPEND TSAN_EA_TESTSUITES
+      ${CMAKE_CURRENT_BINARY_DIR}/${CONFIG_NAME})
+  endif()
+endforeach ()
+
+add_lit_testsuite(check-tsan-escape-analysis "Running ThreadSanitizer tests (escape analysis)"
+        ${TSAN_EA_TESTSUITES}
+        DEPENDS ${TSAN_TEST_DEPS})
+set_target_properties(check-tsan-escape-analysis PROPERTIES FOLDER "Compiler-RT Tests")
