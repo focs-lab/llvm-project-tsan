@@ -263,7 +263,7 @@ bool EscapeAnalysisInfo::isExternalObject(const Value *Base) {
          isa<Argument>(Base);
 }
 
-bool EscapeAnalysisInfo::EscapeCaptureTracker::doesStoreSrcOrDestEscapes(
+bool EscapeAnalysisInfo::EscapeCaptureTracker::doesStoreDestEscapes(
     const Value *Dest) {
   LLVM_DEBUG(dbgs() << "  Analyzing store destination: " << *Dest << "\n");
   // Find base objects for the storage location
@@ -286,26 +286,12 @@ bool EscapeAnalysisInfo::EscapeCaptureTracker::doesStoreSrcOrDestEscapes(
 
     // If storing to another local allocation, recursively check if it escapes
     if (const auto *Alloca = dyn_cast<AllocaInst>(Base)) {
-      // Cycle in the current recursion indicates incomplete local reasoning.
-      // Without a global fixpoint, treat as escape to remain conservative.
-      if (ProcessingSet.count(Alloca)) {
+      if (ProcessingSet.count(Alloca)) { // Cycle
         LLVM_DEBUG(dbgs() << Alloca->getName() << " is processing now, skip\n");
         continue;
-        // LLVM_DEBUG(dbgs() << "  Cyclic store dependency, escapes\n");
-        // LLVM_DEBUG({
-        //   dbgs() << "    Alloca involved in cycle: " << *Alloca << "\n";
-        //   dbgs() << "    ProcessingSet size=" << ProcessingSet.size() << "\n";
-        //   dbgs() << "    ProcessingSet contents:\n";
-        //   for (const Value *V : ProcessingSet) {
-        //     dbgs() << "      - " << *V << "\n";
-        //   }
-        // });
-        // return true;
       }
 
       // Recurse to decide whether the target alloca itself escapes.
-      // auto RecursiveProcessingSet = ProcessingSet;
-      // RecursiveProcessingSet.insert(Alloca);
       if (EAI.solveEscapeFor(*Alloca, ProcessingSet)) {
         LLVM_DEBUG(dbgs() << "  Stored to escaping alloca, escapes\n");
         return true;
@@ -346,7 +332,7 @@ bool EscapeAnalysisInfo::EscapeCaptureTracker::doesStoredPointerEscapeViaLoads(
             LLVM_DEBUG(dbgs() << "\tEscape: " << *StoreToPtr->getValueOperand()
                               << "\n");
             // Check whether we store the pointer to an external pointer
-            if (doesStoreSrcOrDestEscapes(StoreToPtr->getPointerOperand())) {
+            if (doesStoreDestEscapes(StoreToPtr->getPointerOperand())) {
               LLVM_DEBUG(dbgs() << "Store to escaping object, escape\n");
               Escaped = true;
               return Stop;
@@ -390,7 +376,7 @@ EscapeAnalysisInfo::EscapeCaptureTracker::captured(const Use *U,
     if (Store->getValueOperand() == U->get()) {
       LLVM_DEBUG(dbgs() << "    Storing pointer value, analyze destination\n");
       if (Store->isVolatile() || Store->isAtomic() ||
-          doesStoreSrcOrDestEscapes(Store->getPointerOperand())) {
+          doesStoreDestEscapes(Store->getPointerOperand())) {
         LLVM_DEBUG(dbgs() << "  Store to escaping destination, escapes\n");
         Escaped = true;
         return Stop;

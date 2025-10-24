@@ -151,7 +151,7 @@ private:
     bool Escaped = false;
 
     /// Analyze if storing to destination causes escape
-    bool doesStoreSrcOrDestEscapes(const Value *Dest);
+    bool doesStoreDestEscapes(const Value *Dest);
 
     /// Analyze whether the pointer value stored by `Store` can escape
     bool doesStoredPointerEscapeViaLoads(const StoreInst *Store);
@@ -161,9 +161,9 @@ private:
   bool solveEscapeFor(const Value &Alloca,
                       SmallPtrSet<const Value *, 32> &ProcessingSet);
 
-  // Helper function to detect heap allocations.
-  // Required because isAllocationFn() requires the 'allockind' attribute,
-  // which older Clang versions don't generate for malloc/calloc/etc.
+  /// Detect heap allocations. Required because isAllocationFn() requires
+  /// the 'allockind' attribute, which older Clang versions don't generate
+  /// for malloc/calloc/etc.
   static bool isHeapAllocation(const CallBase *CB,
                                const TargetLibraryInfo *TLI);
 
