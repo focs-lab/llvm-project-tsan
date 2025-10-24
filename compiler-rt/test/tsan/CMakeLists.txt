@@ -29,45 +29,72 @@ if(APPLE)
   darwin_filter_host_archs(TSAN_SUPPORTED_ARCH TSAN_TEST_ARCH)
 endif()
 
-foreach(arch ${TSAN_TEST_ARCH})
-  set(TSAN_TEST_APPLE_PLATFORM "osx")
-  set(TSAN_TEST_MIN_DEPLOYMENT_TARGET_FLAG "${DARWIN_osx_MIN_VER_FLAG}")
+# Unified function for generating TSAN test suites by architectures.
+# Arguments:
+#   OUT_LIST_VAR    - name of output list (for example, TSAN_TESTSUITES or TSAN_EA_TESTSUITES)
+#   SUFFIX_KIND     - string added to config suffix after "-${arch}" (for example, "" or "-escape")
+#   CONFIG_KIND     - string added to config name after "Config" (for example, "" or "Escape")
+#   ENABLE_EA       - "True"/"False" enable escape analysis
+function(tsan_generate_arch_suites OUT_LIST_VAR SUFFIX_KIND CONFIG_KIND ENABLE_EA)
+  foreach(arch ${TSAN_TEST_ARCH})
+    set(TSAN_ENABLE_ESCAPE_ANALYSIS "${ENABLE_EA}")
 
-  set(TSAN_TEST_TARGET_ARCH ${arch})
-  string(TOLOWER "-${arch}" TSAN_TEST_CONFIG_SUFFIX)
-  get_test_cc_for_arch(${arch} TSAN_TEST_TARGET_CC TSAN_TEST_TARGET_CFLAGS)
+    set(TSAN_TEST_APPLE_PLATFORM "osx")
+    set(TSAN_TEST_MIN_DEPLOYMENT_TARGET_FLAG "${DARWIN_osx_MIN_VER_FLAG}")
 
-  string(REPLACE ";" " " LIBDISPATCH_CFLAGS_STRING " ${COMPILER_RT_TEST_LIBDISPATCH_CFLAGS}")
-  string(APPEND TSAN_TEST_TARGET_CFLAGS ${LIBDISPATCH_CFLAGS_STRING})
+    set(TSAN_TEST_TARGET_ARCH ${arch})
+    string(TOLOWER "-${arch}${SUFFIX_KIND}" TSAN_TEST_CONFIG_SUFFIX)
+    get_test_cc_for_arch(${arch} TSAN_TEST_TARGET_CC TSAN_TEST_TARGET_CFLAGS)
 
-  if (COMPILER_RT_HAS_MSSE4_2_FLAG)
-    string(APPEND TSAN_TEST_TARGET_CFLAGS " -msse4.2 ")
-  endif()
+    string(REPLACE ";" " " LIBDISPATCH_CFLAGS_STRING " ${COMPILER_RT_TEST_LIBDISPATCH_CFLAGS}")
+    string(APPEND TSAN_TEST_TARGET_CFLAGS ${LIBDISPATCH_CFLAGS_STRING})
 
-  string(TOUPPER ${arch} ARCH_UPPER_CASE)
-  set(CONFIG_NAME ${ARCH_UPPER_CASE}Config)
+    if (COMPILER_RT_HAS_MSSE4_2_FLAG)
+      string(APPEND TSAN_TEST_TARGET_CFLAGS " -msse4.2 ")
+    endif()
 
-  configure_lit_site_cfg(
-    ${CMAKE_CURRENT_SOURCE_DIR}/lit.site.cfg.py.in
-    ${CMAKE_CURRENT_BINARY_DIR}/${CONFIG_NAME}/lit.site.cfg.py
-    MAIN_CONFIG
-    ${CMAKE_CURRENT_SOURCE_DIR}/lit.cfg.py
-    )
-  list(APPEND TSAN_TESTSUITES ${CMAKE_CURRENT_BINARY_DIR}/${CONFIG_NAME})
+    string(TOUPPER ${arch} ARCH_UPPER_CASE)
+    set(CONFIG_NAME ${ARCH_UPPER_CASE}Config${CONFIG_KIND})
 
-  if(COMPILER_RT_TSAN_HAS_STATIC_RUNTIME)
-    string(TOLOWER "-${arch}-${OS_NAME}-dynamic" TSAN_TEST_CONFIG_SUFFIX)
-    set(CONFIG_NAME ${ARCH_UPPER_CASE}${OS_NAME}DynamicConfig)
     configure_lit_site_cfg(
-      ${CMAKE_CURRENT_SOURCE_DIR}/lit.site.cfg.py.in
-      ${CMAKE_CURRENT_BINARY_DIR}/${CONFIG_NAME}/lit.site.cfg.py
-      MAIN_CONFIG
-      ${CMAKE_CURRENT_SOURCE_DIR}/lit.cfg.py
+            ${CMAKE_CURRENT_SOURCE_DIR}/lit.site.cfg.py.in
+            ${CMAKE_CURRENT_BINARY_DIR}/${CONFIG_NAME}/lit.site.cfg.py
+            MAIN_CONFIG
+            ${CMAKE_CURRENT_SOURCE_DIR}/lit.cfg.py
+    )
+    list(APPEND ${OUT_LIST_VAR} ${CMAKE_CURRENT_BINARY_DIR}/${CONFIG_NAME})
+
+    if(COMPILER_RT_TSAN_HAS_STATIC_RUNTIME)
+      # Dynamic runtime for corresponding variant
+      if("${SUFFIX_KIND}" STREQUAL "")
+        string(TOLOWER "-${arch}-${OS_NAME}-dynamic" TSAN_TEST_CONFIG_SUFFIX)
+        set(CONFIG_NAME ${ARCH_UPPER_CASE}${OS_NAME}DynamicConfig${CONFIG_KIND})
+        list(APPEND TSAN_DYNAMIC_TESTSUITES ${CMAKE_CURRENT_BINARY_DIR}/${CONFIG_NAME})
+      else()
+        string(TOLOWER "-${arch}-${OS_NAME}-dynamic${SUFFIX_KIND}" TSAN_TEST_CONFIG_SUFFIX)
+        set(CONFIG_NAME ${ARCH_UPPER_CASE}${OS_NAME}DynamicConfig${CONFIG_KIND})
+      endif()
+      configure_lit_site_cfg(
+              ${CMAKE_CURRENT_SOURCE_DIR}/lit.site.cfg.py.in
+              ${CMAKE_CURRENT_BINARY_DIR}/${CONFIG_NAME}/lit.site.cfg.py
+              MAIN_CONFIG
+              ${CMAKE_CURRENT_SOURCE_DIR}/lit.cfg.py
       )
-    list(APPEND TSAN_DYNAMIC_TESTSUITES
-      ${CMAKE_CURRENT_BINARY_DIR}/${CONFIG_NAME})
-  endif()
-endforeach()
+      list(APPEND ${OUT_LIST_VAR} ${CMAKE_CURRENT_BINARY_DIR}/${CONFIG_NAME})
+    endif()
+  endforeach()
+
+  # Propagate the assembled list to the parent scope
+  set(${OUT_LIST_VAR} "${${OUT_LIST_VAR}}" PARENT_SCOPE)
+endfunction()
+
+# Default configuration
+set(TSAN_TESTSUITES)
+tsan_generate_arch_suites(TSAN_TESTSUITES "" "" "False")
+
+# Enable escape analysis (check-tsan-escape-analysis target)
+set(TSAN_EA_TESTSUITES)
+tsan_generate_arch_suites(TSAN_EA_TESTSUITES "-escape" "Escape" "True")
 
 # iOS and iOS simulator test suites
 # These are not added into "check-all", in order to run these tests, use
@@ -137,53 +164,6 @@ if(COMPILER_RT_TSAN_HAS_STATIC_RUNTIME)
                     EXCLUDE_FROM_CHECK_ALL
                     DEPENDS ${TSAN_DYNAMIC_TEST_DEPS})
 endif()
-
-# -----------------------------------------------------------------------------
-# New target: check-tsan-escape-analysis
-# Reuse the same test directories but generate configs with enabled flag.
-set(TSAN_EA_TESTSUITES)
-foreach (arch ${TSAN_TEST_ARCH})
-  # Enable escape analysis flag
-  set(TSAN_ENABLE_ESCAPE_ANALYSIS "True")
-
-  set(TSAN_TEST_APPLE_PLATFORM "osx")
-  set(TSAN_TEST_MIN_DEPLOYMENT_TARGET_FLAG "${DARWIN_osx_MIN_VER_FLAG}")
-
-  set(TSAN_TEST_TARGET_ARCH ${arch})
-  string(TOLOWER "-${arch}-escape" TSAN_TEST_CONFIG_SUFFIX)
-  get_test_cc_for_arch(${arch} TSAN_TEST_TARGET_CC TSAN_TEST_TARGET_CFLAGS)
-
-  string(REPLACE ";" " " LIBDISPATCH_CFLAGS_STRING " ${COMPILER_RT_TEST_LIBDISPATCH_CFLAGS}")
-  string(APPEND TSAN_TEST_TARGET_CFLAGS ${LIBDISPATCH_CFLAGS_STRING})
-
-  if (COMPILER_RT_HAS_MSSE4_2_FLAG)
-    string(APPEND TSAN_TEST_TARGET_CFLAGS " -msse4.2 ")
-  endif ()
-
-  string(TOUPPER ${arch} ARCH_UPPER_CASE)
-  set(CONFIG_NAME ${ARCH_UPPER_CASE}ConfigEscape)
-
-  configure_lit_site_cfg(
-    ${CMAKE_CURRENT_SOURCE_DIR}/lit.site.cfg.py.in
-    ${CMAKE_CURRENT_BINARY_DIR}/${CONFIG_NAME}/lit.site.cfg.py
-    MAIN_CONFIG
-    ${CMAKE_CURRENT_SOURCE_DIR}/lit.cfg.py
-  )
-  list(APPEND TSAN_EA_TESTSUITES ${CMAKE_CURRENT_BINARY_DIR}/${CONFIG_NAME})
-
-  if(COMPILER_RT_TSAN_HAS_STATIC_RUNTIME)
-    string(TOLOWER "-${arch}-${OS_NAME}-dynamic-escape" TSAN_TEST_CONFIG_SUFFIX)
-    set(CONFIG_NAME ${ARCH_UPPER_CASE}${OS_NAME}DynamicConfigEscape)
-    configure_lit_site_cfg(
-      ${CMAKE_CURRENT_SOURCE_DIR}/lit.site.cfg.py.in
-      ${CMAKE_CURRENT_BINARY_DIR}/${CONFIG_NAME}/lit.site.cfg.py
-      MAIN_CONFIG
-      ${CMAKE_CURRENT_SOURCE_DIR}/lit.cfg.py
-    )
-    list(APPEND TSAN_EA_TESTSUITES
-      ${CMAKE_CURRENT_BINARY_DIR}/${CONFIG_NAME})
-  endif()
-endforeach ()
 
 add_lit_testsuite(check-tsan-escape-analysis "Running ThreadSanitizer tests (escape analysis)"
         ${TSAN_EA_TESTSUITES}
