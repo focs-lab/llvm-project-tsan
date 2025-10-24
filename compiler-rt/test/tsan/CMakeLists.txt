@@ -73,6 +73,8 @@ function(tsan_generate_arch_suites OUT_LIST_VAR SUFFIX_KIND CONFIG_KIND ENABLE_E
       else()
         string(TOLOWER "-${arch}-${OS_NAME}-dynamic${SUFFIX_KIND}" TSAN_TEST_CONFIG_SUFFIX)
         set(CONFIG_NAME ${ARCH_UPPER_CASE}${OS_NAME}DynamicConfig${CONFIG_KIND})
+        # Track dynamic escape-analysis suites separately for a dedicated target.
+        list(APPEND TSAN_EA_DYNAMIC_TESTSUITES ${CMAKE_CURRENT_BINARY_DIR}/${CONFIG_NAME})
       endif()
       configure_lit_site_cfg(
               ${CMAKE_CURRENT_SOURCE_DIR}/lit.site.cfg.py.in
@@ -86,6 +88,9 @@ function(tsan_generate_arch_suites OUT_LIST_VAR SUFFIX_KIND CONFIG_KIND ENABLE_E
 
   # Propagate the assembled list to the parent scope
   set(${OUT_LIST_VAR} "${${OUT_LIST_VAR}}" PARENT_SCOPE)
+  if(DEFINED TSAN_EA_DYNAMIC_TESTSUITES)
+    set(TSAN_EA_DYNAMIC_TESTSUITES "${TSAN_EA_DYNAMIC_TESTSUITES}" PARENT_SCOPE)
+  endif()
 endfunction()
 
 # Default configuration
@@ -152,6 +157,10 @@ list(APPEND TSAN_TESTSUITES ${CMAKE_CURRENT_BINARY_DIR}/Unit)
 if(COMPILER_RT_TSAN_HAS_STATIC_RUNTIME)
   list(APPEND TSAN_DYNAMIC_TESTSUITES ${CMAKE_CURRENT_BINARY_DIR}/Unit/dynamic)
 endif()
+list(APPEND TSAN_EA_TESTSUITES ${CMAKE_CURRENT_BINARY_DIR}/Unit)
+if(COMPILER_RT_TSAN_HAS_STATIC_RUNTIME)
+  list(APPEND TSAN_EA_DYNAMIC_TESTSUITES ${CMAKE_CURRENT_BINARY_DIR}/Unit/dynamic)
+endif()
 
 add_lit_testsuite(check-tsan "Running ThreadSanitizer tests"
   ${TSAN_TESTSUITES}
@@ -169,3 +178,12 @@ add_lit_testsuite(check-tsan-escape-analysis "Running ThreadSanitizer tests (esc
         ${TSAN_EA_TESTSUITES}
         DEPENDS ${TSAN_TEST_DEPS})
 set_target_properties(check-tsan-escape-analysis PROPERTIES FOLDER "Compiler-RT Tests")
+
+# New target: dynamic + escape analysis
+if(COMPILER_RT_TSAN_HAS_STATIC_RUNTIME)
+  add_lit_testsuite(check-tsan-escape-analysis-dynamic "Running ThreadSanitizer tests (dynamic, escape analysis)"
+                    ${TSAN_EA_DYNAMIC_TESTSUITES}
+                    EXCLUDE_FROM_CHECK_ALL
+                    DEPENDS ${TSAN_DYNAMIC_TEST_DEPS})
+  set_target_properties(check-tsan-escape-analysis-dynamic PROPERTIES FOLDER "Compiler-RT Tests")
+endif()
