@@ -26,6 +26,55 @@
 
 namespace llvm {
 
+// getUnderlyingObjects(..., MaxLookup = 0) is assumed to mean "unbounded".
+// If upstream changes semantics, this must be revisited.
+static const unsigned VTMaxLookup = 0;
+
+/// A stronger variant of `llvm::getUnderlyingObjects` that uses MemorySSA
+/// to chase defining writes and, when possible, look through loads. This is
+/// more precise (and potentially more expensive) than plain ValueTracking.
+///
+/// \param Ptr        A pointer-typed value to analyze.
+/// \param MSSA     A valid, up-to-date MemorySSA for V. Must not be null.
+/// \param AA
+/// \param Result   Output set that will be populated with the results.
+///                 The set is not cleared; new elements are inserted into it.
+/// \param LI       Optional LoopInfo used to improve reasoning about PHIs in
+///                 loops in ValueTracking.
+///
+/// \post
+///  - `Result` is augmented with zero or more pointer-typed "terminal
+///  sources" for `V`.
+///  - A "terminal source" is a pointer value where this analysis
+///  intentionally stops. Typical terminals include:
+///      * `AllocaInst`, `GlobalVariable`, `Argument`, `ConstantPointerNull`.
+///      * An SSA pointer value such as a `LoadInst` (or `PHINode`/`Select`
+///        as returned by ValueTracking) when MemorySSA cannot prove a precise
+///        defining write for the loaded bytes (e.g., memory is liveOnEntry,
+///        written by an opaque call, clobbered by memset/atomics/volatile,
+///        etc.).
+///      * A call result if ValueTracking stops at a call that returns a
+///      pointer
+///        (i.e., the usual terminals that `getUnderlyingObjects` would
+///        produce).
+///
+/// \note
+///  - If the analysis cannot find any sound terminal sources (e.g., due to a
+///    cycle or lack of proof), it is permitted to insert nothing. However, to
+///    match the spirit of `getUnderlyingObjects` and to keep clients
+///    predictable, when the walk stops at a pointer-typed SSA value (e.g., a
+///    `LoadInst`), this API is encouraged to insert that SSA value to
+///    represent an "unknown terminal".
+///  - The result is a may-set: `Result` contains all terminal candidates the
+///    analysis can conservatively identify, not a single precise source.
+///
+void getUnderlyingObjectsThroughLoads(const Value *Ptr, MemorySSA *MSSA,
+                                      AAResults *AA,
+                                      SmallPtrSetImpl<const Value *> &Result,
+                                      LoopInfo *LI = nullptr,
+                                      bool *IsComplete = nullptr,
+                                      unsigned MaxSteps = 10000);
+
 /// EscapeAnalysisInfo - This class implements the actual backward dataflow
 /// analysis for a function; queries are per allocation site.
 ///
@@ -64,72 +113,6 @@ private:
   LoopInfo *LI = nullptr;
   AAResults *AA = nullptr;
 
-  // getUnderlyingObjects(..., MaxLookup = 0) is assumed to mean "unbounded".
-  // If upstream changes semantics, this must be revisited.
-  static const unsigned VTMaxLookup = 0;
-
-  /// Add P to Worklist if it doesn't exist in Seen
-  template <class PtrT, class SetT, class WorklistT>
-  static bool tryEnqueueIfNew(PtrT *P, SetT &Seen, WorklistT &Worklist);
-
-  /// Try to use ValueTracking to find underlying objects.
-  static bool tryValueTracking(const Value *V, LoopInfo *LI,
-                               SmallVectorImpl<const Value *> &Work,
-                               SmallPtrSetImpl<const Value *> &Enqueued);
-
-  /// Add incoming unvisited MemoryAccesses of a MemoryPhi to MAWorkList.
-  static void appendIncomingMAs(const MemoryPhi *MPhi,
-                                SmallPtrSetImpl<MemoryAccess *> &VisitedMA,
-                                SmallVectorImpl<MemoryAccess *> &MAWorkList,
-                                MemoryLocation Loc, MemorySSAWalker *Walker);
-  bool isNonAtomicNonVolatile(const Value *V);
-
-  ///===- GetUnderlyingObjectsThroughLoads
-  ///---------------------------------===//
-  ///
-  /// A stronger variant of `llvm::getUnderlyingObjects` that uses MemorySSA
-  /// to chase defining writes and, when possible, look through loads. This is
-  /// more precise (and potentially more expensive) than plain ValueTracking.
-  ///
-  /// \param Ptr        A pointer-typed value to analyze.
-  /// \param MSSA     A valid, up-to-date MemorySSA for V. Must not be null.
-  /// \param AA
-  /// \param Result   Output set that will be populated with the results.
-  ///                 The set is not cleared; new elements are inserted into it.
-  /// \param LI       Optional LoopInfo used to improve reasoning about PHIs in
-  ///                 loops in ValueTracking.
-  ///
-  /// \post
-  ///  - `Result` is augmented with zero or more pointer-typed "terminal
-  ///  sources" for `V`.
-  ///  - A "terminal source" is a pointer value where this analysis
-  ///  intentionally stops. Typical terminals include:
-  ///      * `AllocaInst`, `GlobalVariable`, `Argument`, `ConstantPointerNull`.
-  ///      * An SSA pointer value such as a `LoadInst` (or `PHINode`/`Select`
-  ///        as returned by ValueTracking) when MemorySSA cannot prove a precise
-  ///        defining write for the loaded bytes (e.g., memory is liveOnEntry,
-  ///        written by an opaque call, clobbered by memset/atomics/volatile,
-  ///        etc.).
-  ///      * A call result if ValueTracking stops at a call that returns a
-  ///      pointer
-  ///        (i.e., the usual terminals that `getUnderlyingObjects` would
-  ///        produce).
-  ///
-  /// \note
-  ///  - If the analysis cannot find any sound terminal sources (e.g., due to a
-  ///    cycle or lack of proof), it is permitted to insert nothing. However, to
-  ///    match the spirit of `getUnderlyingObjects` and to keep clients
-  ///    predictable, when the walk stops at a pointer-typed SSA value (e.g., a
-  ///    `LoadInst`), this API is encouraged to insert that SSA value to
-  ///    represent an "unknown terminal".
-  ///  - The result is a may-set: `Result` contains all terminal candidates the
-  ///    analysis can conservatively identify, not a single precise source.
-  ///
-  static void getUnderlyingObjectsThroughLoads(
-      const Value *Ptr, MemorySSA *MSSA, AAResults *AA,
-      SmallPtrSetImpl<const Value *> &Result, LoopInfo *LI = nullptr,
-      bool *IsComplete = nullptr, unsigned MaxSteps = 10000);
-
   /// Checks whether a base location is externally visible (thus escapes).
   static bool isExternalObject(const Value *Base);
 
@@ -153,12 +136,20 @@ private:
     /// Analyze if storing to destination causes escape
     bool doesStoreDestEscapes(const Value *Dest);
 
+    /// Walk MemorySSA forward from StartStore and collect pointer-typed Loads
+    /// whose clobber for LocDest is reachable from StartMDef (through
+    /// MemoryPhi), i.e. the Load may read the bytes written by StartStore.
+    SmallVector<const LoadInst *, 32>
+    collectLoadsReadingFromStore(const StoreInst *StartStore, bool &IsComplete);
+
     /// Analyze whether the pointer value stored by `Store` can escape
+    // bool doesStoredPointerEscape(const StoreInst *Store);
+    // bool doesStoredPointerEscape2(const StoreInst *Store);
     bool doesStoredPointerEscapeViaLoads(const StoreInst *Store);
   };
 
   /// Solve escape for a single allocation site using backward dataflow.
-  bool solveEscapeFor(const Value &Alloca,
+  bool solveEscapeFor(const Value &Ptr,
                       SmallPtrSet<const Value *, 32> &ProcessingSet);
 
   /// Detect heap allocations. Required because isAllocationFn() requires
