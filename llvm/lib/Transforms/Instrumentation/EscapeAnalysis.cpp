@@ -42,7 +42,7 @@ WorklistLimit("escape-analysis-worklist-limit", cl::init(1000), cl::Hidden,
                        "if exceeded, assume the allocation escapes"));
 
 //===----------------------------------------------------------------------===//
-// getUnderlyingObjectsThroughLoads Implementation
+// MemorySSA-related utils
 //===----------------------------------------------------------------------===//
 
 namespace llvm {
@@ -56,249 +56,19 @@ static bool tryEnqueueIfNew(PtrT *P, SetT &Seen, WorklistT &Worklist) {
   return false;
 }
 
-/// Try to use ValueTracking to find underlying objects.
-static bool tryValueTracking(const Value *V, LoopInfo *LI,
-                             SmallVectorImpl<const Value *> &Work,
-                             SmallPtrSetImpl<const Value *> &Enqueued) {
-  SmallVector<const Value *, 4> Bases;
-  if (!V->getType()->isPointerTy())
-    return false; // Only pointers have underlying objects.
-
-  getUnderlyingObjects(V, Bases, LI, VTMaxLookup);
-
-  if (Bases.empty() || (Bases.size() == 1 && Bases[0] == V))
-    return false;
-
-  for (const Value *B : Bases)
-    tryEnqueueIfNew(B, Enqueued, Work);
-  return true;
-}
-
-
-void getUnderlyingObjectsThroughLoads(const Value *Ptr, MemorySSA *MSSA,
-                                      AAResults *AA,
-                                      SmallPtrSetImpl<const Value *> &Result,
-                                      LoopInfo *LI, bool *IsComplete,
-                                      unsigned MaxSteps) {
-  LLVM_DEBUG(dbgs() << "\tgetUnderlyingObjectsThroughLoads: " << Ptr->getName()
-                    << "\n");
-
-  assert(MSSA && "MemorySSA is required for this analysis");
-  MemorySSAWalker *Walker = MSSA->getSkipSelfWalker();
-
-  if (!Ptr->getType()->isPointerTy()) {
-    LLVM_DEBUG(dbgs() << "Input is not a pointer, early return: " << *Ptr
-                      << "\n");
-    return; // Only pointers have underlying objects.
-  }
-
-  auto addTerminal = [&](const Value *Term,
-                         bool MarkIncompleteIfNotBase = true) {
-    if (!Term || !Term->getType()->isPointerTy())
-      return;
-    const bool IsBase = isa<AllocaInst>(Term) || isa<GlobalVariable>(Term) ||
-                        isa<GlobalAlias>(Term) || isa<Argument>(Term) ||
-                        isa<ConstantPointerNull>(Term);
-    LLVM_DEBUG(dbgs() << "\tMark terminal: " << *Term << " IsBase="
-                      << (IsBase ? "yes" : "no") << "\n");
-    Result.insert(Term);
-    if (IsComplete && !IsBase && MarkIncompleteIfNotBase) {
-      *IsComplete = false;
-      LLVM_DEBUG(dbgs() << "\tMarking incomplete due to terminal\n");
-    }
-  };
-
-  SmallPtrSet<const Value *, 32> SeenVT;    // 1st stage (ValueTracking)
-  SmallPtrSet<const Value *, 32> Seen;      // Guard for enqueue
-  SmallVector<const Value *, 32> Worklist;
-
-  auto bail = [&]() {
-    if (IsComplete)
-      *IsComplete = false;
-    for (const Value *WV : Worklist)
-      addTerminal(WV);
-  };
-
-  tryEnqueueIfNew(Ptr, Seen, Worklist);
-
-  unsigned Step = 0;
-  if (IsComplete)
-    *IsComplete = true;
-
-  while (!Worklist.empty()) {
-    const Value *CurrPtr = Worklist.pop_back_val();
-
-    // Safety valve: if we exceed MaxSteps, bail out conservatively.
-    if (++Step > MaxSteps) {
-      LLVM_DEBUG(dbgs() << "MaxSteps exceeded at: " << *CurrPtr << "\n");
-      addTerminal(CurrPtr);
-      bail();
-      return;
-    }
-
-    // Try ValueTracking first (only once per value)
-    if (!isa<LoadInst>(CurrPtr) && SeenVT.insert(CurrPtr).second &&
-        tryValueTracking(CurrPtr, LI, Worklist, Seen))
-      continue; // Successfully expanded via ValueTracking;
-
-    const auto *Load = dyn_cast<LoadInst>(CurrPtr);
-    if (!Load || Load->isVolatile() || Load->isAtomic()) {
-      addTerminal(CurrPtr);
-      continue;
-    }
-
-    const auto LoadLoc = MemoryLocation::get(Load);
-
-    // Use MemorySSA's API to get the clobbering MemoryAccess.
-    MemoryAccess *Clobber = Walker->getClobberingMemoryAccess(Load);
-    assert(Clobber && "Expected clobbering MemoryAccess");
-
-    // Local accumulators for Load
-    SmallVector<const Value *, 8> LocalWorklist;
-    SmallPtrSet<const Value *, 8> LocalSeen;
-    SmallPtrSet<MemoryAccess *, 32> VisitedMA;
-    SmallVector<MemoryAccess *, 32> MAWorklist;
-
-    LocalSeen.insert(Load);
-    bool Fallback = false;
-    unsigned MaxMAIterations = 0;
-    const unsigned MAIterationLimit = std::max(1u, MaxSteps / 2);
-
-    if (!tryEnqueueIfNew(Clobber, VisitedMA, MAWorklist))
-      continue;
-
-    while (!MAWorklist.empty()) {
-      if (++MaxMAIterations > MAIterationLimit) {
-        LLVM_DEBUG(dbgs() << "MA iteration limit exceeded, fallback at Load: "
-                          << *Load << "\n");
-        Fallback = true;
-        break;
-      }
-      MemoryAccess *CurrClobber = MAWorklist.pop_back_val();
-
-      if (MSSA->isLiveOnEntryDef(CurrClobber)) {
-        // Try to get base objects from the current load.
-        const Value *PtrOpnd = Load->getPointerOperand()->stripPointerCasts();
-        tryEnqueueIfNew(PtrOpnd, Seen, Worklist);
-        continue;
-      }
-
-      if (const auto *MDef = dyn_cast<MemoryDef>(CurrClobber)) {
-        // If clobber is a MemoryDef, inspect its instruction.
-        const Instruction *ClobberI = MDef->getMemoryInst();
-        assert(ClobberI && "MemoryDef must have an instruction");
-
-        // Stores: chase the stored pointer when safe
-        if (const auto *Store = dyn_cast<StoreInst>(ClobberI)) {
-          // Volatile or atomic stores are opaque.
-          if (Store->isVolatile() || Store->isAtomic()) {
-            Fallback = true;
-            break;
-          }
-
-          const Value *SV = Store->getValueOperand();
-          if (SV->getType()->isPointerTy()) {
-            tryEnqueueIfNew(SV, LocalSeen, LocalWorklist);
-            continue;
-          }
-          // Non-pointer store into memory from which we later load a pointer:
-          // treat as unknown/opaque write.
-          LLVM_DEBUG(dbgs()
-                     << "Non-pointer store, fallback at: " << *Store << "\n");
-        }
-        // NOTE: We intentionally don't consider the source in memintrinsics
-        // (e.g. memmove/memcpy/memset): they are not underlying objects
-        LLVM_DEBUG(dbgs() << "Unrecognized defining write, fallback\n");
-        // Fallback: unrecognized defining write, stop here conservatively.
-        Fallback = true;
-        break;
-      }
-
-      if (const auto *MPhi = dyn_cast<MemoryPhi>(CurrClobber))
-        appendIncomingMAs(MPhi, VisitedMA, MAWorklist, LoadLoc, Walker);
-      else
-        llvm_unreachable("Unexpected MemoryAccess kind");
-    } // end while for MAWorkList
-
-    if (Fallback) {
-      LLVM_DEBUG(dbgs() << "Fallback: mark Load as term: " << *Load << "\n");
-      addTerminal(Load);
-    } else {
-      for (const auto *WV : LocalWorklist)
-        tryEnqueueIfNew(WV, Seen, Worklist);
-    }
-  } // end while for Work
-  LLVM_DEBUG(dbgs() << "\tgetUnderlyingObjectsThroughLoads: " << Ptr->getName()
-                    << " -- end\n");
-}
-
-} // end namespace llvm
-
-//===----------------------------------------------------------------------===//
-// EscapeCaptureTracker Implementation
-//===----------------------------------------------------------------------===//
-
-bool EscapeAnalysisInfo::EscapeCaptureTracker::shouldExplore(const Use *U) {
-  // Always explore, but we can add optimizations here later
-  return true;
-}
-
-bool EscapeAnalysisInfo::isExternalObject(const Value *Base) {
-  return isa<GlobalVariable>(Base) || isa<GlobalAlias>(Base) ||
-         isa<Argument>(Base);
-}
-
-bool EscapeAnalysisInfo::EscapeCaptureTracker::doesStoreDestEscapes(
-    const Value *Dest) {
-  // Find base objects for the storage location
-  SmallPtrSet<const Value *, 8> BaseObjects;
-  bool IsComplete = false;
-  getUnderlyingObjectsThroughLoads(Dest, EAI.MSSA, EAI.AA, BaseObjects, EAI.LI,
-                                   &IsComplete);
-
-  // If bases are unknown or the walk is incomplete, be conservative.
-  if (BaseObjects.empty() || !IsComplete) {
-    LLVM_DEBUG(dbgs() << "  Store destination unknown/incomplete, escapes\n");
-    return true;
-  }
-
-  for (const Value *Base : BaseObjects) {
-    if (isExternalObject(Base)) {
-      LLVM_DEBUG(dbgs() << "  Stored to external object, escapes\n");
-      return true;
-    }
-
-    // If storing to another local allocation, recursively check if it escapes
-    if (const auto *Alloca = dyn_cast<AllocaInst>(Base)) {
-      if (ProcessingSet.count(Alloca)) { // Cycle
-        LLVM_DEBUG(dbgs() << Alloca->getName() << " is processing now, skip\n");
-        continue;
-      }
-
-      // Recurse to decide whether the target alloca itself escapes.
-      if (EAI.solveEscapeFor(*Alloca, ProcessingSet)) {
-        LLVM_DEBUG(dbgs() << "  Stored to escaping alloca, escapes\n");
-        return true;
-      }
-      continue;
-    }
-    // Any other/unknown terminal means the destination is not proven local.
-    LLVM_DEBUG(dbgs() << "  Stored to unknown location: " << *Base
-                      << ", escapes\n");
-    return true;
-  }
-  return false;
-}
-
 /// Add incoming unvisited MemoryAccesses of a MemoryPhi to MAWorkList.
 static void appendIncomingMAs(const MemoryPhi *MPhi,
                               SmallPtrSetImpl<MemoryAccess *> &VisitedMA,
                               SmallVectorImpl<MemoryAccess *> &MAWorkList,
-                              MemoryLocation Loc, MemorySSAWalker *Walker) {
+                              MemoryLocation Loc, MemorySSAWalker *Walker,
+                              bool &IsComplete) {
   for (unsigned i = 0, N = MPhi->getNumIncomingValues(); i != N; ++i) {
     MemoryAccess *InMA = MPhi->getIncomingValue(i);
     MemoryAccess *EdgeCl = Walker->getClobberingMemoryAccess(InMA, Loc);
-    if (!EdgeCl) EdgeCl = InMA;
+    if (!EdgeCl) {
+      IsComplete = false;
+      continue;
+    }
     tryEnqueueIfNew(EdgeCl, VisitedMA, MAWorkList);
   }
 }
@@ -342,12 +112,219 @@ static bool walkEdgeClobbers(MemoryAccess *Start, MemorySSA *MSSA,
       }
       tryEnqueueIfNew(EdgeCl, MAVisited, MAWorklist);
     } else if (const auto *MPhi = dyn_cast<MemoryPhi>(MA)) {
-      appendIncomingMAs(MPhi, MAVisited, MAWorklist, Loc, Walker);
+      appendIncomingMAs(MPhi, MAVisited, MAWorklist, Loc, Walker, IsComplete);
+      if (!IsComplete)
+        return false;
     } else {
       llvm_unreachable("Unexpected MemoryAccess kind");
     }
   }
   return true;
+}
+
+/// Try to use ValueTracking to find underlying objects.
+static bool tryValueTracking(const Value *V, LoopInfo *LI,
+                             SmallVectorImpl<const Value *> &Work,
+                             SmallPtrSetImpl<const Value *> &Enqueued) {
+  SmallVector<const Value *, 4> Bases;
+  if (!V->getType()->isPointerTy())
+    return false; // Only pointers have underlying objects.
+
+  getUnderlyingObjects(V, Bases, LI, VTMaxLookup);
+
+  if (Bases.empty() || (Bases.size() == 1 && Bases[0] == V))
+    return false;
+
+  for (const Value *B : Bases)
+    tryEnqueueIfNew(B, Enqueued, Work);
+  return true;
+}
+
+void getUnderlyingObjectsThroughLoads(const Value *Ptr, MemorySSA *MSSA,
+                                      SmallPtrSetImpl<const Value *> &Result,
+                                      LoopInfo *LI, bool *IsComplete,
+                                      unsigned MaxSteps) {
+  LLVM_DEBUG(dbgs() << "\tgetUnderlyingObjectsThroughLoads: " << Ptr->getName()
+                    << "\n");
+
+  if (!Ptr->getType()->isPointerTy()) {
+    LLVM_DEBUG(dbgs() << "Input is not a pointer: " << *Ptr << "\n");
+    return; // Only pointers have underlying objects.
+  }
+
+  auto addTerminal = [&](const Value *Term,
+                         bool MarkIncompleteIfNotBase = true) {
+    if (!Term || !Term->getType()->isPointerTy())
+      return;
+    const bool IsBase = isa<AllocaInst>(Term) || isa<GlobalVariable>(Term) ||
+                        isa<GlobalAlias>(Term) || isa<Argument>(Term) ||
+                        isa<ConstantPointerNull>(Term);
+    LLVM_DEBUG(dbgs() << "\tMark terminal: " << *Term << " IsBase="
+                      << (IsBase ? "yes" : "no") << "\n");
+    Result.insert(Term);
+    if (IsComplete && !IsBase && MarkIncompleteIfNotBase) {
+      *IsComplete = false;
+      LLVM_DEBUG(dbgs() << "\tMarking incomplete due to non-base\n");
+    }
+  };
+
+  SmallPtrSet<const Value *, 32> SeenVT;    // 1st stage (ValueTracking)
+  SmallPtrSet<const Value *, 32> Seen;
+  SmallVector<const Value *, 32> Worklist;
+
+  auto bail = [&]() {
+    if (IsComplete)
+      *IsComplete = false;
+    for (const Value *WV : Worklist)
+      addTerminal(WV);
+  };
+
+  tryEnqueueIfNew(Ptr, Seen, Worklist);
+
+  unsigned Step = 0;
+  if (IsComplete)
+    *IsComplete = true;
+
+  MemorySSAWalker *Walker = MSSA->getSkipSelfWalker();
+
+  while (!Worklist.empty()) {
+    const Value *CurrPtr = Worklist.pop_back_val();
+
+    // Safety valve: if we exceed MaxSteps, bail out conservatively.
+    if (++Step > MaxSteps) {
+      LLVM_DEBUG(dbgs() << "MaxSteps exceeded at: " << *CurrPtr << "\n");
+      addTerminal(CurrPtr);
+      bail();
+      return;
+    }
+
+    // Try ValueTracking first (only once per value)
+    if (!isa<LoadInst>(CurrPtr) && SeenVT.insert(CurrPtr).second &&
+        tryValueTracking(CurrPtr, LI, Worklist, Seen))
+      continue; // Successfully expanded via ValueTracking;
+
+    const auto *Load = dyn_cast<LoadInst>(CurrPtr);
+    if (!Load || Load->isVolatile() || Load->isAtomic()) {
+      addTerminal(CurrPtr);
+      continue;
+    }
+
+    // Use MemorySSA's API to get the clobbering MemoryAccess.
+    MemoryAccess *Clobber = Walker->getClobberingMemoryAccess(Load);
+    assert(Clobber && "Expected clobbering MemoryAccess");
+    const auto LoadLoc = MemoryLocation::get(Load);
+
+    // Local accumulators for Load
+    SmallVector<const Value *, 8> LocalWorklist;
+    SmallPtrSet<const Value *, 8> LocalSeen;
+
+    LocalSeen.insert(Load);
+    bool Fallback = false;
+    bool WalkComplete = false;
+    const unsigned MAIterationLimit = std::max(1u, MaxSteps / 2);
+
+    walkEdgeClobbers(
+        Clobber, MSSA, Walker, LoadLoc, MAIterationLimit,
+        [&](MemoryAccess *MA) -> EdgeWalkStep {
+          if (const auto *MDef = dyn_cast<MemoryDef>(MA)) {
+            const Instruction *I = MDef->getMemoryInst();
+            assert(I && "MemoryDef must have an instruction");
+
+            if (const auto *Store = dyn_cast<StoreInst>(I)) {
+              if (Store->isVolatile() || Store->isAtomic()) {
+                Fallback = true;
+                return EdgeWalkStep::Stop;
+              }
+              const Value *SV = Store->getValueOperand();
+              if (SV->getType()->isPointerTy()) {
+                tryEnqueueIfNew(SV, LocalSeen, LocalWorklist);
+                // Reached defining store for LoadLoc — stop this path here.
+                return EdgeWalkStep::SkipSuccessors;
+              }
+              LLVM_DEBUG(dbgs() << "Non-pointer store: " << *Store << "\n");
+              Fallback = true;
+              return EdgeWalkStep::Stop;
+            }
+            // NOTE: We intentionally don't consider the source in memintrinsics
+            // (memmove/memcpy): they are not semantically underlying objects
+            LLVM_DEBUG(dbgs() << "Unrecognized defining write, fallback\n");
+            Fallback = true;
+            return EdgeWalkStep::Stop;
+          }
+          return EdgeWalkStep::Recurse;
+        },
+        WalkComplete);
+
+    if (!WalkComplete) Fallback = true;
+
+    if (Fallback) {
+      LLVM_DEBUG(dbgs() << "Fallback: mark Load as term: " << *Load << "\n");
+      addTerminal(Load);
+    } else {
+      for (const auto *WV : LocalWorklist)
+        tryEnqueueIfNew(WV, Seen, Worklist);
+    }
+  } // end while for Work
+  LLVM_DEBUG(dbgs() << "\tgetUnderlyingObjectsThroughLoads: " << Ptr->getName()
+                    << " -- end\n");
+}
+
+} // end namespace llvm
+
+//===----------------------------------------------------------------------===//
+// EscapeCaptureTracker Implementation
+//===----------------------------------------------------------------------===//
+
+bool EscapeAnalysisInfo::EscapeCaptureTracker::shouldExplore(const Use *U) {
+  // Always explore, but we can add optimizations here later
+  return true;
+}
+
+bool EscapeAnalysisInfo::isExternalObject(const Value *Base) {
+  return isa<GlobalVariable>(Base) || isa<GlobalAlias>(Base) ||
+         isa<Argument>(Base);
+}
+
+bool EscapeAnalysisInfo::EscapeCaptureTracker::doesStoreDestEscapes(
+    const Value *Dest) {
+  // Find base objects for the storage location
+  SmallPtrSet<const Value *, 8> BaseObjects;
+  bool IsComplete = false;
+  getUnderlyingObjectsThroughLoads(Dest, EAI.MSSA, BaseObjects, EAI.LI,
+                                   &IsComplete);
+
+  // If bases are unknown or the walk is incomplete, be conservative.
+  if (BaseObjects.empty() || !IsComplete) {
+    LLVM_DEBUG(dbgs() << "  Store destination unknown/incomplete, escapes\n");
+    return true;
+  }
+
+  for (const Value *Base : BaseObjects) {
+    if (isExternalObject(Base)) {
+      LLVM_DEBUG(dbgs() << "  Stored to external object, escapes\n");
+      return true;
+    }
+
+    // If storing to another local allocation, recursively check if it escapes
+    if (const auto *Alloca = dyn_cast<AllocaInst>(Base)) {
+      if (ProcessingSet.count(Alloca)) { // Cycle
+        LLVM_DEBUG(dbgs() << Alloca->getName() << " is processing now, skip\n");
+        continue;
+      }
+
+      // Recurse to decide whether the target alloca itself escapes.
+      if (EAI.solveEscapeFor(*Alloca, ProcessingSet)) {
+        LLVM_DEBUG(dbgs() << "  Stored to escaping alloca, escapes\n");
+        return true;
+      }
+      continue;
+    }
+    // Any other/unknown terminal means the destination is not proven local.
+    LLVM_DEBUG(dbgs() << "  Stored to unknown location: " << *Base
+                      << ", escapes\n");
+    return true;
+  }
+  return false;
 }
 
 SmallVector<const LoadInst *, 32>
@@ -378,10 +355,10 @@ EscapeAnalysisInfo::EscapeCaptureTracker::collectLoadsReadingFromStore(
     return Found || !WalkComplete;
   };
 
-  SmallVector<const LoadInst *, 32> Out;
+  SmallVector<const LoadInst *, 32> ResLoads;
   SmallVector<MemoryAccess *, 32> MAWorklist;
-  SmallPtrSet<MemoryAccess *, 32> VisitedMA;
-  tryEnqueueIfNew(StartMDef, VisitedMA, MAWorklist);
+  SmallPtrSet<MemoryAccess *, 32> MAVisited;
+  tryEnqueueIfNew(StartMDef, MAVisited, MAWorklist);
 
   unsigned Steps = 0;
   while (!MAWorklist.empty()) {
@@ -408,14 +385,14 @@ EscapeAnalysisInfo::EscapeCaptureTracker::collectLoadsReadingFromStore(
           continue;
 
         LLVM_DEBUG(dbgs() << "Found Load reading from Store: " << *Load << "\n");
-        Out.push_back(Load);
+        ResLoads.push_back(Load);
         continue;
       }
 
-      tryEnqueueIfNew(cast<MemoryAccess>(U), VisitedMA, MAWorklist);
+      tryEnqueueIfNew(cast<MemoryAccess>(U), MAVisited, MAWorklist);
     }
   }
-  return Out;
+  return ResLoads;
 }
 
 bool EscapeAnalysisInfo::EscapeCaptureTracker::
@@ -507,10 +484,6 @@ EscapeAnalysisInfo::EscapeCaptureTracker::captured(const Use *U,
 #endif
 }
 
-//===----------------------------------------------------------------------===//
-// EscapeAnalysis Core Implementation
-//===----------------------------------------------------------------------===//
-
 bool EscapeAnalysisInfo::solveEscapeFor(
     const Value &Ptr, SmallPtrSet<const Value *, 32> &ProcessingSet) {
   // Mark this allocation as being processed to prevent infinite recursion
@@ -539,6 +512,10 @@ bool EscapeAnalysisInfo::solveEscapeFor(
                     << " ============\n";);
   return Tracker.hasEscaped();
 }
+
+//===----------------------------------------------------------------------===//
+// EscapeAnalysis Core Implementation
+//===----------------------------------------------------------------------===//
 
 bool EscapeAnalysisInfo::isHeapAllocation(const CallBase *CB,
                                           const TargetLibraryInfo *TLI) {
