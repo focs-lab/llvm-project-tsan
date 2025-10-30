@@ -36,7 +36,6 @@ static const unsigned VTMaxLookup = 0;
 ///
 /// \param Ptr        A pointer-typed value to analyze.
 /// \param MSSA     A valid, up-to-date MemorySSA for V. Must not be null.
-/// \param AA
 /// \param Result   Output set that will be populated with the results.
 ///                 The set is not cleared; new elements are inserted into it.
 /// \param LI       Optional LoopInfo used to improve reasoning about PHIs in
@@ -69,7 +68,6 @@ static const unsigned VTMaxLookup = 0;
 ///    analysis can conservatively identify, not a single precise source.
 ///
 void getUnderlyingObjectsThroughLoads(const Value *Ptr, MemorySSA *MSSA,
-                                      AAResults *AA,
                                       SmallPtrSetImpl<const Value *> &Result,
                                       LoopInfo *LI = nullptr,
                                       bool *IsComplete = nullptr,
