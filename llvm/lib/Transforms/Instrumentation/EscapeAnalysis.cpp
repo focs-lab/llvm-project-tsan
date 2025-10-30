@@ -74,18 +74,6 @@ static bool tryValueTracking(const Value *V, LoopInfo *LI,
   return true;
 }
 
-/// Add incoming unvisited MemoryAccesses of a MemoryPhi to MAWorkList.
-static void appendIncomingMAs(const MemoryPhi *MPhi,
-                              SmallPtrSetImpl<MemoryAccess *> &VisitedMA,
-                              SmallVectorImpl<MemoryAccess *> &MAWorkList,
-                              MemoryLocation Loc, MemorySSAWalker *Walker) {
-  for (unsigned i = 0, N = MPhi->getNumIncomingValues(); i != N; ++i) {
-    MemoryAccess *InMA = MPhi->getIncomingValue(i);
-    MemoryAccess *EdgeCl = Walker->getClobberingMemoryAccess(InMA, Loc);
-    if (!EdgeCl) EdgeCl = InMA;
-    tryEnqueueIfNew(EdgeCl, VisitedMA, MAWorkList);
-  }
-}
 
 void getUnderlyingObjectsThroughLoads(const Value *Ptr, MemorySSA *MSSA,
                                       AAResults *AA,
@@ -219,10 +207,8 @@ void getUnderlyingObjectsThroughLoads(const Value *Ptr, MemorySSA *MSSA,
                      << "Non-pointer store, fallback at: " << *Store << "\n");
         }
         // NOTE: We intentionally don't consider the source in memintrinsics
-        // (e.g. memmove/memcpy/memset) because they are not semantically
-        // underlying objects
+        // (e.g. memmove/memcpy/memset): they are not underlying objects
         LLVM_DEBUG(dbgs() << "Unrecognized defining write, fallback\n");
-
         // Fallback: unrecognized defining write, stop here conservatively.
         Fallback = true;
         break;
@@ -304,6 +290,66 @@ bool EscapeAnalysisInfo::EscapeCaptureTracker::doesStoreDestEscapes(
   return false;
 }
 
+/// Add incoming unvisited MemoryAccesses of a MemoryPhi to MAWorkList.
+static void appendIncomingMAs(const MemoryPhi *MPhi,
+                              SmallPtrSetImpl<MemoryAccess *> &VisitedMA,
+                              SmallVectorImpl<MemoryAccess *> &MAWorkList,
+                              MemoryLocation Loc, MemorySSAWalker *Walker) {
+  for (unsigned i = 0, N = MPhi->getNumIncomingValues(); i != N; ++i) {
+    MemoryAccess *InMA = MPhi->getIncomingValue(i);
+    MemoryAccess *EdgeCl = Walker->getClobberingMemoryAccess(InMA, Loc);
+    if (!EdgeCl) EdgeCl = InMA;
+    tryEnqueueIfNew(EdgeCl, VisitedMA, MAWorkList);
+  }
+}
+
+enum class EdgeWalkStep { Recurse, SkipSuccessors, Stop };
+
+/// Walk edge clobbering definitions starting from Start MemoryAccess.
+template <typename VisitT>
+static bool walkEdgeClobbers(MemoryAccess *Start, MemorySSA *MSSA,
+                             MemorySSAWalker *Walker, MemoryLocation Loc,
+                             unsigned Limit, VisitT Visit, bool &IsComplete) {
+  IsComplete = true;
+  if (!Start) return true;
+
+  SmallVector<MemoryAccess *, 32> MAWorklist;
+  SmallPtrSet<MemoryAccess *, 32> MAVisited;
+  tryEnqueueIfNew(Start, MAVisited, MAWorklist);
+  unsigned Steps = 0;
+
+  while (!MAWorklist.empty()) {
+    if (++Steps > Limit) {
+      IsComplete = false;
+      return false;
+    }
+
+    MemoryAccess *MA = MAWorklist.pop_back_val();
+    if (MSSA->isLiveOnEntryDef(MA))
+      continue;
+
+    EdgeWalkStep Act = Visit(MA);
+    if (Act == EdgeWalkStep::Stop)
+      return false;
+    if (Act == EdgeWalkStep::SkipSuccessors)
+      continue;
+
+    if (auto *MD = dyn_cast<MemoryDef>(MA)) {
+      MemoryAccess *EdgeCl = Walker->getClobberingMemoryAccess(MD, Loc);
+      if (!EdgeCl) {
+        IsComplete = false;
+        return false;
+      }
+      tryEnqueueIfNew(EdgeCl, MAVisited, MAWorklist);
+    } else if (const auto *MPhi = dyn_cast<MemoryPhi>(MA)) {
+      appendIncomingMAs(MPhi, MAVisited, MAWorklist, Loc, Walker);
+    } else {
+      llvm_unreachable("Unexpected MemoryAccess kind");
+    }
+  }
+  return true;
+}
+
 SmallVector<const LoadInst *, 32>
 EscapeAnalysisInfo::EscapeCaptureTracker::collectLoadsReadingFromStore(
     const StoreInst *StartStore, bool &IsComplete) {
@@ -314,38 +360,22 @@ EscapeAnalysisInfo::EscapeCaptureTracker::collectLoadsReadingFromStore(
   const MemoryLocation LocDest = MemoryLocation::get(StartStore);
   MemorySSAWalker *Walker = EAI.MSSA->getSkipSelfWalker();
 
-  auto IsFromStart = [&](MemoryAccess *Cl) -> bool {
-    if (!Cl) return false;
-    SmallVector<MemoryAccess *, 32> Worklist;
-    SmallPtrSet<MemoryAccess *, 32> Visited;
-    tryEnqueueIfNew(Cl, Visited, Worklist);
-    unsigned Steps = 0;
-
-    while (!Worklist.empty()) {
-      if (++Steps > WorklistLimit) {
-        IsComplete = false;
-        return true;
-      }
-
-      MemoryAccess *MA = Worklist.pop_back_val();
-      LLVM_DEBUG(dbgs() << "  IsFromStart: Inspecting MA: " << *MA << "\n");
-      if (MA == StartMDef)
-        return true;
-      if (EAI.MSSA->isLiveOnEntryDef(MA))
-        continue;
-
-      if (isa<MemoryDef>(MA)) {
-        MemoryAccess *EdgeCl = Walker->getClobberingMemoryAccess(MA, LocDest);
-        if (!EdgeCl) {
-          IsComplete = false;
-          return true;
-        }
-        tryEnqueueIfNew(EdgeCl, Visited, Worklist);
-      } else if (const auto *MPhi = dyn_cast<MemoryPhi>(MA)) {
-        appendIncomingMAs(MPhi, Visited, Worklist, LocDest, Walker);
-      }
-    }
-    return false;
+  auto doesStemFrom = [&](MemoryAccess *Cl) -> bool {
+    bool WalkComplete = false, Found = false;
+    walkEdgeClobbers(
+        Cl, EAI.MSSA, Walker, LocDest, WorklistLimit,
+        [&](MemoryAccess *MA) {
+          LLVM_DEBUG(dbgs() << "  IsFromStart: Inspecting MA: " << *MA << "\n");
+          if (MA == StartMDef) {
+            Found = true;
+            return EdgeWalkStep::Stop;
+          }
+          return EdgeWalkStep::Recurse;
+        },
+        WalkComplete);
+    if (!WalkComplete)
+      IsComplete = false;
+    return Found || !WalkComplete;
   };
 
   SmallVector<const LoadInst *, 32> Out;
@@ -374,7 +404,7 @@ EscapeAnalysisInfo::EscapeCaptureTracker::collectLoadsReadingFromStore(
           IsComplete = false;
           return {};
         }
-        if (!IsFromStart(Clobber))
+        if (!doesStemFrom(Clobber))
           continue;
 
         LLVM_DEBUG(dbgs() << "Found Load reading from Store: " << *Load << "\n");
