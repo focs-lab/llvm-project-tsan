@@ -141,7 +141,6 @@ public:
   /// \param DT The Dominator Tree for the current function.
   /// \param PDT The Post-Dominator Tree for the current function.
   /// \param AA The results of Alias Analysis.
-  /// \param TLI Target Library Info, used to identify dangerous calls.
   DominanceBasedElimination(SmallVectorImpl<InstructionInfo> &AllInstr,
                             DominatorTree &DT, PostDominatorTree &PDT,
                             AAResults &AA)
@@ -152,8 +151,6 @@ public:
       buildBlockSafetyCache(*F);
     }
   }
-
-  // const TargetLibraryInfo &TLI), TLI(TLI) {}
 
   /// Runs the analysis and prunes redundant instructions.
   /// It sequentially applies elimination based on dominance and post-dominance.
@@ -247,7 +244,6 @@ private:
   DominatorTree &DT;
   PostDominatorTree &PDT;
   AAResults &AA;
-  // const TargetLibraryInfo &TLI;
 };
 
 /// ThreadSanitizer: instrument the code in module to find races.
@@ -391,27 +387,18 @@ bool isTsanAtomic(const Instruction *I) {
 }
 
 bool DominanceBasedElimination::isInstrSafe(const Instruction *Inst) {
-  // 1. Atomic operations with inter-thread communication are the primary
-  //    source of synchronization and are NEVER safe.
+  // Atomic operations with inter-thread communication are the primary
+  // source of synchronization and are never safe.
   if (isTsanAtomic(Inst))
     return false;
 
-  // 2. Check function calls.
+  // Check function calls, if it's known to be sync-free
   if (const auto *CB = dyn_cast<CallBase>(Inst)) {
-    if (const Function *Callee = CB->getCalledFunction()) {
-      // If a function is known to be sync-free (e.g., @llvm.sqrt), then false.
-      // Otherwise - true.
-      if (Callee->doesNotAccessMemory() || Callee->onlyReadsMemory() ||
-          Callee->hasNoSync())
-        return true;
-      // Conservatively: any non-intrinsic and not explicitly safe call is
-      // dangerous
-      return false;
-    }
-    // Indirect call - always dangerous for simplicity
+    if (const Function *Callee = CB->getCalledFunction())
+      return Callee->hasNoSync();
     return false;
   }
-  // 3. All other instructions are considered safe because they do not,
+  // All other instructions are considered safe because they do not,
   // by themselves, create happens-before relationships
   return true;
 }
@@ -527,6 +514,7 @@ bool DominanceBasedElimination::isPathClear(
 
   // Forward traversal from StartBB, restricted to the cone that reach EndBB.
   const bool Res = traverseReachableAndCheckSafety(StartBB, EndBB, CanReachEnd);
+  BSC.ConeSafeCache[StartBB][EndBB] = Res;
   LLVM_DEBUG(dbgs() << "isPathClear: " << (Res ? "true" : "false") << "\n");
   return Res;
 }
@@ -586,8 +574,16 @@ bool DominanceBasedElimination::findAndMarkDominatingInstr(
       InstructionInfo &DomII = AllInstr[DomIndex];
       Instruction *DomInst = DomII.Inst;
 
-      const Value *DomAddr = getLoadStorePointerOperand(DomInst);
-      if (AA.isMustAlias(CurrAddr, DomAddr)) {
+      auto IsVolatile = [](const Instruction *I) {
+        if (const auto *L = dyn_cast<LoadInst>(I))  return L->isVolatile();
+        if (const auto *S = dyn_cast<StoreInst>(I)) return S->isVolatile();
+        return false;
+      };
+      if (ClDistinguishVolatile && IsVolatile(DomInst))
+        continue;
+
+      if (AA.isMustAlias(MemoryLocation::get(CurrInst),
+                         MemoryLocation::get(DomInst))) {
         auto isWriteOperation = [](const InstructionInfo &II) {
           return isa<StoreInst>(II.Inst) ||
                  (II.Flags & InstructionInfo::kCompoundRW);
@@ -596,9 +592,8 @@ bool DominanceBasedElimination::findAndMarkDominatingInstr(
         const bool DomIsWrite = isWriteOperation(DomII);
 
         // Check compatibility logic (DomInst covers CurrInst):
-        // 1. If DomInst is a 'write', it covers both read and write of
-        // CurrInst.
-        // 2. If DomInst is a 'read', it only covers a read of CurrInst.
+        // 1. If DomInst is a 'write', it covers both read and write.
+        // 2. If DomInst is a 'read', it only covers a read.
         if (DomIsWrite || !CurrIsWrite) {
           // Check the path to/from CurrInst from/to DomInst
           bool IsPathClear = false;
