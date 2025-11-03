@@ -14,6 +14,7 @@ target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f3
 ; --- External Function Declarations for Tests ---
 declare void @some_external_call()
 declare void @llvm.donothing() #0
+declare void @external_check()
 
 ; =============================================================================
 ; INTRA-BLOCK DOMINANCE TESTS
@@ -451,6 +452,34 @@ end:
 ; CHECK:       end:
 ; CHECK-NOT:   call void @__tsan_read4(ptr @g1)
 ; CHECK:       ret void
+
+; =============================================================================
+; POST-DOMINANCE WITH LOOP
+; =============================================================================
+define void @postdom_loop() nounwind uwtable sanitize_thread {
+entry:
+  br label %while.cond
+
+while.cond:                                       ; preds = %while.body, %entry
+  %call = call i32 (...) @external_check()
+  %tobool = icmp ne i32 %call, 0
+  br i1 %tobool, label %while.body, label %while.end
+
+while.body:                                       ; preds = %while.cond
+  store i32 1, ptr @g1, align 4
+  br label %while.cond
+
+while.end:                                        ; preds = %while.cond
+  store i32 2, ptr @g1, align 4
+  ret void
+}
+; It's a potentially infinite loop,
+; so the store in while.end should not be eliminated.
+; CHECK-LABEL: define void @postdom_loop
+; CHECK:       while.body:
+; CHECK:       call void @__tsan_write4(ptr @g1)
+; CHECK:       while.end:
+; CHECK:       call void @__tsan_write4(ptr @g1)
 
 ; Attributes for the "safe" intrinsic
 attributes #0 = { nounwind readnone }

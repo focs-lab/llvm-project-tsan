@@ -26,6 +26,7 @@
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/Analysis/AliasAnalysis.h"
 #include "llvm/Analysis/CaptureTracking.h"
+#include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/PostDominators.h"
 #include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/Analysis/ValueTracking.h"
@@ -92,6 +93,10 @@ static cl::opt<bool>
                            cl::desc("Eliminate duplicating instructions which "
                                     "(post)dominates given instruction"),
                            cl::Hidden);
+static cl::opt<bool> ClPostDomAggressive(
+    "tsan-postdom-aggressive", cl::init(false),
+    cl::desc("Allow post-dominance elimination across loops (unsafe)"),
+    cl::Hidden);
 
 STATISTIC(NumInstrumentedReads, "Number of instrumented reads");
 STATISTIC(NumInstrumentedWrites, "Number of instrumented writes");
@@ -143,8 +148,8 @@ public:
   /// \param AA The results of Alias Analysis.
   DominanceBasedElimination(SmallVectorImpl<InstructionInfo> &AllInstr,
                             DominatorTree &DT, PostDominatorTree &PDT,
-                            AAResults &AA)
-      : AllInstr(AllInstr), DT(DT), PDT(PDT), AA(AA) {
+                            AAResults &AA, LoopInfo &LI)
+      : AllInstr(AllInstr), DT(DT), PDT(PDT), AA(AA), LI(LI) {
     // Build per-function basic-block safety cache once
     if (!AllInstr.empty() && AllInstr.front().Inst) {
       Function *F = AllInstr.front().Inst->getFunction();
@@ -201,6 +206,8 @@ private:
   SmallPtrSet<const BasicBlock *, 32> buildCanReachEnd(const BasicBlock *EndBB);
 
   /// Forward traversal from StartBB, restricted to the cone that reach EndBB.
+  /// In post-dom mode additionally rejects paths that go through any loop BB.
+  template <bool IsPostDom>
   bool traverseReachableAndCheckSafety(
       const BasicBlock *StartBB, const BasicBlock *EndBB,
       const SmallPtrSetImpl<const BasicBlock *> &CanReachEnd);
@@ -244,6 +251,7 @@ private:
   DominatorTree &DT;
   PostDominatorTree &PDT;
   AAResults &AA;
+  LoopInfo &LI;
 };
 
 /// ThreadSanitizer: instrument the code in module to find races.
@@ -253,9 +261,9 @@ private:
 /// ensures the __tsan_init function is in the list of global constructors for
 /// the module.
 struct ThreadSanitizer {
-  ThreadSanitizer(const TargetLibraryInfo &TLI_, DominatorTree *DT_,
-                  PostDominatorTree *PDT_, AAResults *AA_)
-      : TLI(TLI_), DT(DT_), PDT(PDT_), AA(AA_) {
+  ThreadSanitizer(const TargetLibraryInfo &TLI, DominatorTree *DT,
+                  PostDominatorTree *PDT, AAResults *AA, LoopInfo *LI)
+      : TLI(TLI), DT(DT), PDT(PDT), AA(AA), LI(LI) {
     // Check options and warn user.
     if (ClInstrumentReadBeforeWrite && ClCompoundReadBeforeWrite) {
       errs()
@@ -283,6 +291,7 @@ private:
   DominatorTree *DT = nullptr;
   PostDominatorTree *PDT = nullptr;
   AAResults *AA = nullptr;
+  LoopInfo *LI = nullptr;
 
   Type *IntptrTy;
   FunctionCallee TsanFuncEntry;
@@ -430,6 +439,7 @@ DominanceBasedElimination::buildCanReachEnd(const BasicBlock *EndBB) {
   return BSC.ReachableToEnd[EndBB];
 }
 
+template <bool IsPostDom>
 bool DominanceBasedElimination::traverseReachableAndCheckSafety(
     const BasicBlock *StartBB, const BasicBlock *EndBB,
     const SmallPtrSetImpl<const BasicBlock *> &CanReachEnd) {
@@ -452,6 +462,15 @@ bool DominanceBasedElimination::traverseReachableAndCheckSafety(
     if (BB == EndBB)
       continue;
 
+    // Post-dom safety: any intermediate BB that is part of a loop
+    // makes elimination unsafe (potential infinite loop).
+    if constexpr (IsPostDom) {
+      if (!ClPostDomAggressive &&
+          LI.getLoopFor(BB) != nullptr) {
+        return false;
+      }
+    }
+
     // Any dangerous instruction in an intermediate BB makes the path “dirty”.
     if (BSC.HasDangerInBB.lookup(BB))
       return false;
@@ -467,8 +486,8 @@ template <bool IsPostDom>
 bool DominanceBasedElimination::isPathClear(
     Instruction *StartInst, Instruction *EndInst,
     const DominatorTreeBase<BasicBlock, IsPostDom> *DTBase) {
-  LLVM_DEBUG(dbgs() << "Checking path from " << *StartInst << " to "
-                    << *EndInst << "\n");
+  LLVM_DEBUG(dbgs() << "Checking path from " << *StartInst << " to " << *EndInst
+                    << "\t(" << (IsPostDom ? "PostDom" : "Dom") << ")\n");
 
   const BasicBlock *StartBB = StartInst->getParent();
   const BasicBlock *EndBB = EndInst->getParent();
@@ -513,7 +532,7 @@ bool DominanceBasedElimination::isPathClear(
   const auto CanReachEnd = buildCanReachEnd(EndBB);
 
   // Forward traversal from StartBB, restricted to the cone that reach EndBB.
-  const bool Res = traverseReachableAndCheckSafety(StartBB, EndBB, CanReachEnd);
+  const bool Res = traverseReachableAndCheckSafety<IsPostDom>(StartBB, EndBB, CanReachEnd);
   BSC.ConeSafeCache[StartBB][EndBB] = Res;
   LLVM_DEBUG(dbgs() << "isPathClear: " << (Res ? "true" : "false") << "\n");
   return Res;
@@ -533,6 +552,8 @@ bool DominanceBasedElimination::findAndMarkDominatingInstr(
     size_t i, const DominatorTreeBase<BasicBlock, IsPostDom> *DTBase,
     const DenseMap<Instruction *, size_t> &InstrToIndexMap,
     SmallVectorImpl<bool> &ToRemove) {
+  LLVM_DEBUG(dbgs() << "\nAnalyzing instruction: " << *(AllInstr[i].Inst)
+                    << "\n");
   const InstructionInfo &CurrII = AllInstr[i];
   Instruction *CurrInst = CurrII.Inst;
   const BasicBlock *CurrBB = CurrInst->getParent();
@@ -696,8 +717,9 @@ PreservedAnalyses ThreadSanitizerPass::run(Function &F,
                   ? &FAM.getResult<PostDominatorTreeAnalysis>(F)
                   : nullptr;
   auto *AA = ClUseDominanceAnalysis ? &FAM.getResult<AAManager>(F) : nullptr;
+  auto *LI = ClUseDominanceAnalysis ? &FAM.getResult<LoopAnalysis>(F) : nullptr;
 
-  ThreadSanitizer TSan(FAM.getResult<TargetLibraryAnalysis>(F), DT, PDT, AA);
+  ThreadSanitizer TSan(FAM.getResult<TargetLibraryAnalysis>(F), DT, PDT, AA, LI);
   if (TSan.sanitizeFunction(F))
     return PreservedAnalyses::none();
   return PreservedAnalyses::all();
@@ -1045,9 +1067,8 @@ bool ThreadSanitizer::sanitizeFunction(Function &F) {
     chooseInstructionsToInstrument(LocalLoadsAndStores, AllLoadsAndStores, DL);
   }
 
-  if (ClUseDominanceAnalysis && DT && PDT && AA) {
-    // DominanceBasedElimination DBE(AllLoadsAndStores, *DT, *PDT, *AA, TLI);
-    DominanceBasedElimination DBE(AllLoadsAndStores, *DT, *PDT, *AA);
+  if (ClUseDominanceAnalysis && DT && PDT && AA && LI) {
+    DominanceBasedElimination DBE(AllLoadsAndStores, *DT, *PDT, *AA, *LI);
     DBE.run();
   }
 
