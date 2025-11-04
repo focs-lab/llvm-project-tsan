@@ -127,6 +127,10 @@ struct InstructionInfo {
 
   explicit InstructionInfo(Instruction *Inst) : Inst(Inst) {}
 
+  bool isWriteOperation() const {
+    return isa<StoreInst>(Inst) || (Flags & kCompoundRW);
+  }
+
   Instruction *Inst;
   unsigned Flags = 0;
 };
@@ -180,8 +184,8 @@ private:
   } BSC;
 
   // Reusable worklists/visited sets to amortize allocations.
-  mutable SmallVector<const BasicBlock *, 32> Worklist;
-  mutable SmallPtrSet<const BasicBlock *, 32> CanReachSet;
+  SmallVector<const BasicBlock *, 32> Worklist;
+  SmallPtrSet<const BasicBlock *, 32> CanReachSet;
 
   void buildBlockSafetyCache(Function &F);
 
@@ -446,21 +450,17 @@ bool DominanceBasedElimination::traverseReachableAndCheckSafety(
   Worklist.clear();
   CanReachSet.clear();
 
-  auto EnqueueNonVisited = [&](const BasicBlock *BB) {
-    if (CanReachSet.insert(BB).second)
+  auto enqueueNonVisited = [&](const BasicBlock *BB) {
+    if ((BB != EndBB) && CanReachSet.insert(BB).second)
       Worklist.push_back(BB);
   };
 
   for (const BasicBlock *Succ : successors(StartBB))
     if (CanReachEnd.count(Succ))
-      EnqueueNonVisited(Succ);
+      enqueueNonVisited(Succ);
 
   while (!Worklist.empty()) {
-    const BasicBlock *BB = Worklist.back();
-    Worklist.pop_back();
-
-    if (BB == EndBB)
-      continue;
+    const BasicBlock *BB = Worklist.pop_back_val();
 
     // Post-dom safety: any intermediate BB that is part of a loop
     // makes elimination unsafe (potential infinite loop).
@@ -476,8 +476,8 @@ bool DominanceBasedElimination::traverseReachableAndCheckSafety(
       return false;
 
     for (const BasicBlock *Succ : successors(BB))
-      if (CanReachEnd.count(Succ))
-        EnqueueNonVisited(Succ);
+      if (CanReachEnd.contains(Succ))
+        enqueueNonVisited(Succ);
   }
   return true;
 }
@@ -488,20 +488,8 @@ bool DominanceBasedElimination::isPathClear(
     const DominatorTreeBase<BasicBlock, IsPostDom> *DTBase) {
   LLVM_DEBUG(dbgs() << "Checking path from " << *StartInst << " to " << *EndInst
                     << "\t(" << (IsPostDom ? "PostDom" : "Dom") << ")\n");
-
   const BasicBlock *StartBB = StartInst->getParent();
   const BasicBlock *EndBB = EndInst->getParent();
-
-  // Sanity: required (post-)dominance relation between blocks/instructions.
-  if (StartBB != EndBB) {
-    if constexpr (!IsPostDom) {
-      if (!DTBase->dominates(StartBB, EndBB))
-        return false;
-    } else {
-      if (!DTBase->dominates(EndBB, StartBB))
-        return false;
-    }
-  }
 
   // Intra-block indices (used in either case).
   const unsigned StartIdx = BSC.IndexInBB.lookup(StartInst);
@@ -512,9 +500,7 @@ bool DominanceBasedElimination::isPathClear(
     return intervalSafeSameBB(StartBB, StartIdx + 1, EndIdx);
 
   // Quick local checks on edges.
-  if (!suffixSafe(StartBB, StartIdx + 1))
-    return false;
-  if (!prefixSafe(EndBB, EndIdx))
+  if (!suffixSafe(StartBB, StartIdx + 1) || !prefixSafe(EndBB, EndIdx))
     return false;
 
   // Cone safety cache lookup.
@@ -541,9 +527,9 @@ bool DominanceBasedElimination::isPathClear(
 DenseMap<Instruction *, size_t>
 DominanceBasedElimination::createInstrToIndexMap() const {
   DenseMap<Instruction *, size_t> InstrToIndexMap;
+  InstrToIndexMap.reserve(AllInstr.size());
   for (size_t i = 0; i < AllInstr.size(); ++i)
-    if (AllInstr[i].Inst) // Ensure the instruction hasn't been removed
-      InstrToIndexMap[AllInstr[i].Inst] = i;
+    InstrToIndexMap[AllInstr[i].Inst] = i;
   return InstrToIndexMap;
 }
 
@@ -552,44 +538,39 @@ bool DominanceBasedElimination::findAndMarkDominatingInstr(
     size_t i, const DominatorTreeBase<BasicBlock, IsPostDom> *DTBase,
     const DenseMap<Instruction *, size_t> &InstrToIndexMap,
     SmallVectorImpl<bool> &ToRemove) {
-  LLVM_DEBUG(dbgs() << "\nAnalyzing instruction: " << *(AllInstr[i].Inst)
-                    << "\n");
+  LLVM_DEBUG(dbgs() << "\nAnalyzing: " << *(AllInstr[i].Inst) << "\n");
   const InstructionInfo &CurrII = AllInstr[i];
   Instruction *CurrInst = CurrII.Inst;
   const BasicBlock *CurrBB = CurrInst->getParent();
-  Value *CurrAddr = getLoadStorePointerOperand(CurrInst);
-  assert(CurrAddr && "Should not happen for load/store");
 
-  DomTreeNode *CurrDTNode = DTBase->getNode(CurrBB);
+  const DomTreeNode *CurrDTNode = DTBase->getNode(CurrBB);
   if (!CurrDTNode)
     return false;
 
   // Traverse up the dominator tree
-  for (const auto *IDomNode = CurrDTNode; IDomNode && IDomNode->getBlock();
+  for (const auto *IDomNode = CurrDTNode; IDomNode;
        IDomNode = IDomNode->getIDom()) {
-    BasicBlock *DomBB = IDomNode->getBlock();
+    const BasicBlock *DomBB = IDomNode->getBlock();
+    if (!DomBB) break;
 
     // Look for a suitable dominating instrumented instruction in DomBB
     auto StartIt = DomBB->begin();
     auto EndIt = DomBB->end();
-    if (CurrBB == DomBB) {
+    if (CurrBB == DomBB) { // We are at the same BB
       if constexpr (IsPostDom)
-        StartIt = CurrInst->getIterator();
+        StartIt = std::next(CurrInst->getIterator());
       else
         EndIt = CurrInst->getIterator();
     }
 
     for (auto InstIt = StartIt; InstIt != EndIt; ++InstIt) {
-      Instruction &PotentialDomInst = *InstIt;
+      const Instruction &PotentialDomInst = *InstIt;
       LLVM_DEBUG(dbgs() << "PotentialDomInst: " << PotentialDomInst << "\n");
-      if (&PotentialDomInst == CurrInst)
-        continue;
 
       // Check if PotentialDomInst is dominating and instrumented
       const auto It = InstrToIndexMap.find(&PotentialDomInst);
-      if ((It == InstrToIndexMap.end()) || ToRemove[It->second])
-        // Not found in AllInstr or already marked for removal
-        continue;
+      if (It == InstrToIndexMap.end() || ToRemove[It->second])
+        continue; // Not found in AllInstr or already marked for removal
 
       const size_t DomIndex = It->second;
       InstructionInfo &DomII = AllInstr[DomIndex];
@@ -605,25 +586,18 @@ bool DominanceBasedElimination::findAndMarkDominatingInstr(
 
       if (AA.isMustAlias(MemoryLocation::get(CurrInst),
                          MemoryLocation::get(DomInst))) {
-        auto isWriteOperation = [](const InstructionInfo &II) {
-          return isa<StoreInst>(II.Inst) ||
-                 (II.Flags & InstructionInfo::kCompoundRW);
-        };
-        const bool CurrIsWrite = isWriteOperation(CurrII);
-        const bool DomIsWrite = isWriteOperation(DomII);
+        const bool CurrIsWrite = CurrII.isWriteOperation();
+        const bool DomIsWrite = DomII.isWriteOperation();
 
         // Check compatibility logic (DomInst covers CurrInst):
         // 1. If DomInst is a 'write', it covers both read and write.
         // 2. If DomInst is a 'read', it only covers a read.
         if (DomIsWrite || !CurrIsWrite) {
           // Check the path to/from CurrInst from/to DomInst
-          bool IsPathClear = false;
-          if constexpr (IsPostDom)
-            IsPathClear = isPathClear<true>(CurrInst, DomInst, DTBase);
-          else
-            IsPathClear = isPathClear<false>(DomInst, CurrInst, DTBase);
+          Instruction *PathStart = IsPostDom ? CurrInst : DomInst;
+          Instruction *PathEnd = IsPostDom ? DomInst : CurrInst;
 
-          if (IsPathClear) {
+          if (isPathClear<IsPostDom>(PathStart, PathEnd, DTBase)) {
             LLVM_DEBUG(dbgs()
                        << "TSAN: Omitting instrumentation for: " << *CurrInst
                        << " ((post-)dominated and covered by: " << *DomInst
@@ -639,6 +613,10 @@ bool DominanceBasedElimination::findAndMarkDominatingInstr(
   return false;
 }
 
+/// Eliminates redundant instrumentation based on (pre/post)dominance analysis.
+/// \tparam IsPostDom If true, uses post-dominance; if false, uses dominance.
+///   Dom mode: DomInst dominates CurrInst (path: Dom → Curr)
+///   PostDom mode: CurrInst post-dominates DomInst (path: Curr → Dom)
 template <bool IsPostDom>
 void DominanceBasedElimination::eliminate() {
   LLVM_DEBUG(dbgs() << "====================================\n=== Starting "
