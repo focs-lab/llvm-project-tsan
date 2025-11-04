@@ -466,7 +466,8 @@ void ThreadSanitizer::chooseInstructionsToInstrument(
 
     const AllocaInst *AI = findAllocaForValue(Addr);
     // Instead of Addr, we should check whether its base pointer is captured.
-    if (AI && !PointerMayBeCaptured(AI, /*ReturnCaptures=*/true) &&
+    if (AI && !ClUseEscapeAnalysisInTSan &&
+        !PointerMayBeCaptured(AI, /*ReturnCaptures=*/true) &&
         ClOmitNonCaptured) {
       // The variable is addressable but not captured, so it cannot be
       // referenced from a different thread and participate in a data race
@@ -477,8 +478,20 @@ void ThreadSanitizer::chooseInstructionsToInstrument(
 
     // Use escape analysis if enabled
     if (AI && ClUseEscapeAnalysisInTSan) {
-      if (auto &EAInfo = FAM->getResult<EscapeAnalysis>(*I->getFunction());
-          !EAInfo.isEscaping(*AI)) {
+      auto &EAInfo = FAM->getResult<EscapeAnalysis>(*I->getFunction());
+      // const auto *Alloc = EAInfo.getAllocaAccessedThroughLoads(Addr);
+      const bool Esc = EAInfo.isEscaping(*AI);
+
+#ifndef NDEBUG
+      // Each capture is an escape. Check it.
+      if (Esc && !PointerMayBeCaptured(AI, /*ReturnCaptures=*/true)) {
+        LLVM_DEBUG(dbgs() << "[TSan][EA] Mismatch: captured but not escaping: "
+                          << *AI << " in " << I->getFunction()->getName()
+                          << "\n");
+        report_fatal_error("TSan EA mismatch: capture implies escape");
+      }
+#endif
+      if (!Esc) {
         NumOmittedByEscapeAnalysis++;
         continue;
       }
@@ -533,7 +546,8 @@ bool ThreadSanitizer::sanitizeFunction(Function &F,
   if (F.hasFnAttribute(Attribute::DisableSanitizerInstrumentation))
     return false;
 
-  initialize(*F.getParent(), FAM->getResult<TargetLibraryAnalysis>(F));
+  auto &TLI = FAM->getResult<TargetLibraryAnalysis>(F);
+  initialize(*F.getParent(), TLI);
   SmallVector<InstructionInfo, 8> AllLoadsAndStores;
   SmallVector<Instruction*, 8> LocalLoadsAndStores;
   SmallVector<Instruction*, 8> AtomicAccesses;
