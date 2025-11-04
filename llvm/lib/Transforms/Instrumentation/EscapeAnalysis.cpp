@@ -95,8 +95,6 @@ static bool walkEdgeClobbers(MemoryAccess *Start, MemorySSA *MSSA,
     }
 
     MemoryAccess *MA = MAWorklist.pop_back_val();
-    if (MSSA->isLiveOnEntryDef(MA))
-      continue;
 
     EdgeWalkStep Act = Visit(MA);
     if (Act == EdgeWalkStep::Stop)
@@ -226,6 +224,14 @@ void getUnderlyingObjectsThroughLoads(const Value *Ptr, MemorySSA *MSSA,
     walkEdgeClobbers(
         Clobber, MSSA, Walker, LoadLoc, MAIterationLimit,
         [&](MemoryAccess *MA) -> EdgeWalkStep {
+          if (MSSA->isLiveOnEntryDef(MA)) {
+            // Try to get base objects from the current load.
+            const Value *PtrOpnd =
+                Load->getPointerOperand()->stripPointerCasts();
+            tryEnqueueIfNew(PtrOpnd, Seen, Worklist);
+            return EdgeWalkStep::SkipSuccessors;
+          }
+
           if (const auto *MDef = dyn_cast<MemoryDef>(MA)) {
             const Instruction *I = MDef->getMemoryInst();
             assert(I && "MemoryDef must have an instruction");
@@ -567,7 +573,7 @@ bool EscapeAnalysisInfo::isEscaping(const Value &Alloc) {
   auto &TLI = FAM.getResult<TargetLibraryAnalysis>(F);
   if (!isAllocationSite(&Alloc, &TLI)) {
     LLVM_DEBUG(dbgs() << "EscapeAnalysis: Not an allocation site: "
-                      << &Alloc << "\n");
+                      << Alloc << "\n");
     return true; // Conservative: unknown things "escape"
   }
 
