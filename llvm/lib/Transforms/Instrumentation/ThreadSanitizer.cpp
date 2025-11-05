@@ -200,13 +200,16 @@ void insertModuleCtor(Module &M) {
 
 PreservedAnalyses ThreadSanitizerPass::run(Function &F,
                                            FunctionAnalysisManager &FAM) {
-  auto *MSSA = ClUseEscapeAnalysisInTSan
-                   ? &FAM.getResult<MemorySSAAnalysis>(F).getMSSA()
-                   : nullptr;
-  auto *LI =
-      ClUseEscapeAnalysisInTSan ? &FAM.getResult<LoopAnalysis>(F) : nullptr;
-  auto *EAI =
-      ClUseEscapeAnalysisInTSan ? &FAM.getResult<EscapeAnalysis>(F) : nullptr;
+
+  MemorySSA *MSSA = nullptr;
+  LoopInfo *LI = nullptr;
+  EscapeAnalysisInfo *EAI = nullptr;
+
+  if (ClUseEscapeAnalysisInTSan) {
+    MSSA = &FAM.getResult<MemorySSAAnalysis>(F).getMSSA();
+    LI = &FAM.getResult<LoopAnalysis>(F);
+    EAI = &FAM.getResult<EscapeAnalysis>(F);
+  }
 
   ThreadSanitizer TSan(FAM.getResult<TargetLibraryAnalysis>(F), EAI, MSSA, LI);
   if (TSan.sanitizeFunction(F, &FAM))
