@@ -11,6 +11,8 @@ target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f3
 
 @G = global ptr null
 @GPtr = dso_local global ptr null, align 8
+@GPtrPtr = dso_local global ptr null, align 8
+@GPtrPtrPtr = dso_local global ptr null, align 8
 @GAlias = alias ptr, ptr @GPtr
 
 %S = type { ptr, ptr }
@@ -433,5 +435,54 @@ define void @worklist_limit_bailout() {
   %c2 = icmp eq ptr %a, null
   %sel = select i1 %c1, ptr %a, ptr %a
   %use = ptrtoint ptr %sel to i64
+  ret void
+}
+
+; ============================================================================ ;
+; Escape through double pointers
+; ============================================================================ ;
+
+define dso_local void @esc_thorugh_double_ptr1() {
+; CHECK-LABEL: Printing analysis 'Escape Analysis' for function 'esc_thorugh_double_ptr1':
+; CHECK:  x escapes: yes
+; CHECK:  p escapes: yes
+; CHECK:  pp escapes: yes
+entry:
+  %x = alloca i32, align 4
+  %p = alloca ptr, align 8
+  %pp = alloca ptr, align 8
+  store ptr %x, ptr %p, align 8
+  store ptr %p, ptr %pp, align 8
+  store ptr %pp, ptr @GPtrPtrPtr, align 8
+  ret void
+}
+
+define dso_local void @esc_thorugh_double_ptr2() {
+; CHECK-LABEL: Printing analysis 'Escape Analysis' for function 'esc_thorugh_double_ptr2':
+; CHECK:  x escapes: yes
+; CHECK:  p escapes: yes
+; CHECK:  pp escapes: no
+entry:
+  %x = alloca i32, align 4
+  %p = alloca ptr, align 8
+  %pp = alloca ptr, align 8
+  store ptr %x, ptr %p, align 8
+  store ptr %p, ptr %pp, align 8
+  %0 = load ptr, ptr %pp, align 8
+  store ptr %0, ptr @GPtrPtr, align 8
+  ret void
+}
+
+define dso_local void @esc_thorugh_double_ptr3() {
+; CHECK-LABEL: Printing analysis 'Escape Analysis' for function 'esc_thorugh_double_ptr3':
+; CHECK:  x escapes: yes
+; CHECK:  pp escapes: no
+entry:
+  %x = alloca i32, align 4
+  %pp = alloca ptr, align 8
+  %0 = load ptr, ptr %pp, align 8
+  store ptr %x, ptr %0, align 8
+  %1 = load ptr, ptr %pp, align 8
+  store ptr %1, ptr @GPtrPtr, align 8
   ret void
 }
