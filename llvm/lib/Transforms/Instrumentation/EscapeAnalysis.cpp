@@ -77,11 +77,14 @@ enum class EdgeWalkStep { Recurse, SkipSuccessors, Stop };
 
 /// Walk edge clobbering definitions starting from Start MemoryAccess.
 template <typename VisitT>
-static bool walkEdgeClobbers(MemoryAccess *Start, MemorySSA *MSSA,
+static void walkEdgeClobbers(MemoryAccess *Start, MemorySSA *MSSA,
                              MemorySSAWalker *Walker, MemoryLocation Loc,
                              unsigned Limit, VisitT Visit, bool &IsComplete) {
   IsComplete = true;
-  if (!Start) return true;
+  if (!Start) {
+    IsComplete = false;
+    return;
+  }
 
   SmallVector<MemoryAccess *, 32> MAWorklist;
   SmallPtrSet<MemoryAccess *, 32> MAVisited;
@@ -89,16 +92,14 @@ static bool walkEdgeClobbers(MemoryAccess *Start, MemorySSA *MSSA,
   unsigned Steps = 0;
 
   while (!MAWorklist.empty()) {
-    if (++Steps > Limit) {
+    if (++Steps > Limit)
       IsComplete = false;
-      return false;
-    }
 
     MemoryAccess *MA = MAWorklist.pop_back_val();
 
-    EdgeWalkStep Act = Visit(MA);
+    const EdgeWalkStep Act = Visit(MA);
     if (Act == EdgeWalkStep::Stop)
-      return false;
+      return;
     if (Act == EdgeWalkStep::SkipSuccessors)
       continue;
 
@@ -106,18 +107,17 @@ static bool walkEdgeClobbers(MemoryAccess *Start, MemorySSA *MSSA,
       MemoryAccess *EdgeCl = Walker->getClobberingMemoryAccess(MD, Loc);
       if (!EdgeCl) {
         IsComplete = false;
-        return false;
+        return;
       }
       tryEnqueueIfNew(EdgeCl, MAVisited, MAWorklist);
     } else if (const auto *MPhi = dyn_cast<MemoryPhi>(MA)) {
       appendIncomingMAs(MPhi, MAVisited, MAWorklist, Loc, Walker, IsComplete);
       if (!IsComplete)
-        return false;
+        return;
     } else {
       llvm_unreachable("Unexpected MemoryAccess kind");
     }
   }
-  return true;
 }
 
 /// Try to use ValueTracking to find underlying objects.
@@ -202,7 +202,7 @@ void getUnderlyingObjectsThroughLoads(const Value *Ptr, MemorySSA *MSSA,
       continue; // Successfully expanded via ValueTracking;
 
     const auto *Load = dyn_cast<LoadInst>(CurrPtr);
-    if (!Load || Load->isVolatile() || Load->isAtomic()) {
+    if (!Load || !Load->isSimple()) {
       addTerminal(CurrPtr);
       continue;
     }
@@ -237,7 +237,7 @@ void getUnderlyingObjectsThroughLoads(const Value *Ptr, MemorySSA *MSSA,
             assert(I && "MemoryDef must have an instruction");
 
             if (const auto *Store = dyn_cast<StoreInst>(I)) {
-              if (Store->isVolatile() || Store->isAtomic()) {
+              if (!Store->isSimple()) {
                 Fallback = true;
                 return EdgeWalkStep::Stop;
               }
@@ -343,10 +343,10 @@ EscapeAnalysisInfo::EscapeCaptureTracker::collectLoadsReadingFromStore(
   const MemoryLocation LocDest = MemoryLocation::get(StartStore);
   MemorySSAWalker *Walker = EAI.MSSA->getSkipSelfWalker();
 
-  auto doesStemFrom = [&](MemoryAccess *Cl) -> bool {
+  auto doesStemFrom = [&](MemoryAccess *Clobber) -> bool {
     bool WalkComplete = false, Found = false;
     walkEdgeClobbers(
-        Cl, EAI.MSSA, Walker, LocDest, WorklistLimit,
+        Clobber, EAI.MSSA, Walker, LocDest, WorklistLimit,
         [&](MemoryAccess *MA) {
           LLVM_DEBUG(dbgs() << "  IsFromStart: Inspecting MA: " << *MA << "\n");
           if (MA == StartMDef) {
@@ -410,8 +410,7 @@ bool EscapeAnalysisInfo::EscapeCaptureTracker::
   if (!IsComplete)
     return true;
   for (const LoadInst *Load: Loads) {
-    if (Load->isVolatile() || Load->isAtomic() ||
-        !Load->getType()->isPointerTy())
+    if (!Load->isSimple() || !Load->getType()->isPointerTy())
       return true;
     if (EAI.solveEscapeFor(*Load, ProcessingSet)) {
       LLVM_DEBUG(dbgs() << "---- doesStoredPointerEscapeThroughLoads - end --> "
@@ -451,15 +450,14 @@ EscapeAnalysisInfo::EscapeCaptureTracker::captured(const Use *U,
     if (Store->getValueOperand() == U->get()) {
       LLVM_DEBUG(dbgs() << "    Storing pointer value, analyze destination "
                         << *Store->getPointerOperand() << "\n");
-      if (Store->isVolatile() || Store->isAtomic() ||
+      if (!Store->isSimple() ||
           doesStoreDestEscapes(Store->getPointerOperand())) {
         LLVM_DEBUG(dbgs() << "  Store to escaping destination, escapes\n");
         Escaped = true;
         return Stop;
       }
 
-      LLVM_DEBUG(dbgs() << "\n---- doesStoredPointerEscape " << *Store
-                        << " ----\n");
+      LLVM_DEBUG(dbgs() << "\n   doesStoredPointerEscape " << *Store << "\n");
       if (doesStoredPointerEscapeViaLoads(Store)) {
         Escaped = true;
         return Stop;
