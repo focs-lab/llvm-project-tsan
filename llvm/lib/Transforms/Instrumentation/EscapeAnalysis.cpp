@@ -77,9 +77,9 @@ enum class EdgeWalkStep { Recurse, SkipSuccessors, Stop };
 
 /// Walk edge clobbering definitions starting from Start MemoryAccess.
 template <typename VisitT>
-static void walkEdgeClobbers(MemoryAccess *Start, MemorySSA *MSSA,
-                             MemorySSAWalker *Walker, MemoryLocation Loc,
-                             unsigned Limit, VisitT Visit, bool &IsComplete) {
+static void walkEdgeClobbers(MemoryAccess *Start, MemorySSAWalker *Walker,
+                             MemoryLocation Loc, unsigned Limit,
+                             const VisitT &Visit, bool &IsComplete) {
   IsComplete = true;
   if (!Start) {
     IsComplete = false;
@@ -92,8 +92,10 @@ static void walkEdgeClobbers(MemoryAccess *Start, MemorySSA *MSSA,
   unsigned Steps = 0;
 
   while (!MAWorklist.empty()) {
-    if (++Steps > Limit)
+    if (++Steps > Limit) {
       IsComplete = false;
+      return;
+    }
 
     MemoryAccess *MA = MAWorklist.pop_back_val();
 
@@ -142,7 +144,7 @@ void getUnderlyingObjectsThroughLoads(const Value *Ptr, MemorySSA *MSSA,
                                       SmallPtrSetImpl<const Value *> &Result,
                                       LoopInfo *LI, bool *IsComplete,
                                       unsigned MaxSteps) {
-  LLVM_DEBUG(dbgs() << "\tgetUnderlyingObjectsThroughLoads: " << Ptr->getName()
+  LLVM_DEBUG(dbgs() << "getUnderlyingObjectsThroughLoads: " << Ptr->getName()
                     << "\n");
 
   if (!Ptr->getType()->isPointerTy()) {
@@ -154,19 +156,19 @@ void getUnderlyingObjectsThroughLoads(const Value *Ptr, MemorySSA *MSSA,
                          bool MarkIncompleteIfNotBase = true) {
     if (!Term || !Term->getType()->isPointerTy())
       return;
-    const bool IsBase = isa<AllocaInst>(Term) || isa<GlobalVariable>(Term) ||
-                        isa<GlobalAlias>(Term) || isa<Argument>(Term) ||
+    const bool IsBase = isa<AllocaInst>(Term) || isa<Argument>(Term) ||
+                        isa<GlobalVariable>(Term) || isa<GlobalAlias>(Term) ||
                         isa<ConstantPointerNull>(Term);
-    LLVM_DEBUG(dbgs() << "\tMark terminal: " << *Term << " IsBase="
+    LLVM_DEBUG(dbgs() << "Mark terminal: " << *Term << " IsBase="
                       << (IsBase ? "yes" : "no") << "\n");
     Result.insert(Term);
     if (IsComplete && !IsBase && MarkIncompleteIfNotBase) {
       *IsComplete = false;
-      LLVM_DEBUG(dbgs() << "\tMarking incomplete due to non-base\n");
+      LLVM_DEBUG(dbgs() << "Marking incomplete due to non-base\n");
     }
   };
 
-  SmallPtrSet<const Value *, 32> SeenVT;    // 1st stage (ValueTracking)
+  SmallPtrSet<const Value *, 32> ValueTrackingSeen;
   SmallPtrSet<const Value *, 32> Seen;
   SmallVector<const Value *, 32> Worklist;
 
@@ -197,7 +199,7 @@ void getUnderlyingObjectsThroughLoads(const Value *Ptr, MemorySSA *MSSA,
     }
 
     // Try ValueTracking first (only once per value)
-    if (!isa<LoadInst>(CurrPtr) && SeenVT.insert(CurrPtr).second &&
+    if (!isa<LoadInst>(CurrPtr) && ValueTrackingSeen.insert(CurrPtr).second &&
         tryValueTracking(CurrPtr, LI, Worklist, Seen))
       continue; // Successfully expanded via ValueTracking;
 
@@ -209,7 +211,6 @@ void getUnderlyingObjectsThroughLoads(const Value *Ptr, MemorySSA *MSSA,
 
     // Use MemorySSA's API to get the clobbering MemoryAccess.
     MemoryAccess *Clobber = Walker->getClobberingMemoryAccess(Load);
-    assert(Clobber && "Expected clobbering MemoryAccess");
     const auto LoadLoc = MemoryLocation::get(Load);
 
     // Local accumulators for Load
@@ -218,18 +219,16 @@ void getUnderlyingObjectsThroughLoads(const Value *Ptr, MemorySSA *MSSA,
 
     LocalSeen.insert(Load);
     bool Fallback = false;
-    bool WalkComplete = false;
+    bool MAWalkComplete = false;
+    // Limit MemorySSA walk to half of the budget
     const unsigned MAIterationLimit = std::max(1u, MaxSteps / 2);
 
     walkEdgeClobbers(
-        Clobber, MSSA, Walker, LoadLoc, MAIterationLimit,
+        Clobber, Walker, LoadLoc, MAIterationLimit,
         [&](MemoryAccess *MA) -> EdgeWalkStep {
           if (MSSA->isLiveOnEntryDef(MA)) {
-            // Try to get base objects from the current load.
-            const Value *PtrOpnd =
-                Load->getPointerOperand()->stripPointerCasts();
-            tryEnqueueIfNew(PtrOpnd, Seen, Worklist);
-            return EdgeWalkStep::SkipSuccessors;
+            Fallback = true;
+            return EdgeWalkStep::Stop;
           }
 
           if (const auto *MDef = dyn_cast<MemoryDef>(MA)) {
@@ -252,16 +251,17 @@ void getUnderlyingObjectsThroughLoads(const Value *Ptr, MemorySSA *MSSA,
               return EdgeWalkStep::Stop;
             }
             // NOTE: We intentionally don't consider the source in memintrinsics
-            // (memmove/memcpy): they are not semantically underlying objects
+            // (memmove/memcpy): they are not semantically underlying objects.
+            // Conservatively assume escape.
             LLVM_DEBUG(dbgs() << "Unrecognized defining write, fallback\n");
             Fallback = true;
             return EdgeWalkStep::Stop;
           }
           return EdgeWalkStep::Recurse;
         },
-        WalkComplete);
+        MAWalkComplete);
 
-    if (!WalkComplete) Fallback = true;
+    if (!MAWalkComplete) Fallback = true;
 
     if (Fallback) {
       LLVM_DEBUG(dbgs() << "Fallback: mark Load as term: " << *Load << "\n");
@@ -271,7 +271,7 @@ void getUnderlyingObjectsThroughLoads(const Value *Ptr, MemorySSA *MSSA,
         tryEnqueueIfNew(WV, Seen, Worklist);
     }
   } // end while for Work
-  LLVM_DEBUG(dbgs() << "\tgetUnderlyingObjectsThroughLoads: " << Ptr->getName()
+  LLVM_DEBUG(dbgs() << "getUnderlyingObjectsThroughLoads: " << Ptr->getName()
                     << " -- end\n");
 }
 
@@ -313,11 +313,6 @@ bool EscapeAnalysisInfo::EscapeCaptureTracker::doesStoreDestEscapes(
 
     // If storing to another local allocation, recursively check if it escapes
     if (const auto *Alloca = dyn_cast<AllocaInst>(Base)) {
-      if (ProcessingSet.count(Alloca)) { // Cycle
-        LLVM_DEBUG(dbgs() << Alloca->getName() << " is processing now, skip\n");
-        continue;
-      }
-
       // Recurse to decide whether the target alloca itself escapes.
       if (EAI.solveEscapeFor(*Alloca, ProcessingSet)) {
         LLVM_DEBUG(dbgs() << "  Stored to escaping alloca, escapes\n");
@@ -346,7 +341,7 @@ EscapeAnalysisInfo::EscapeCaptureTracker::collectLoadsReadingFromStore(
   auto doesStemFrom = [&](MemoryAccess *Clobber) -> bool {
     bool WalkComplete = false, Found = false;
     walkEdgeClobbers(
-        Clobber, EAI.MSSA, Walker, LocDest, WorklistLimit,
+        Clobber, Walker, LocDest, WorklistLimit,
         [&](MemoryAccess *MA) {
           LLVM_DEBUG(dbgs() << "  IsFromStart: Inspecting MA: " << *MA << "\n");
           if (MA == StartMDef) {
@@ -408,7 +403,7 @@ bool EscapeAnalysisInfo::EscapeCaptureTracker::
   bool IsComplete = false;
   const auto Loads = collectLoadsReadingFromStore(Store, IsComplete);
   if (!IsComplete)
-    return true;
+    return true; // We may have missed loads -> conservatively escape
   for (const LoadInst *Load: Loads) {
     if (!Load->isSimple() || !Load->getType()->isPointerTy())
       return true;
@@ -493,13 +488,17 @@ bool EscapeAnalysisInfo::solveEscapeFor(
   // Mark this allocation as being processed to prevent infinite recursion
   LLVM_DEBUG(dbgs() << "============ solveEscapeFor(" << Ptr.getName()
                     << ") ===================\n";);
-  ProcessingSet.insert(&Ptr);
-
-  if (const auto CacheIt = Cache.find(&Ptr);
-      CacheIt != Cache.end() && CacheIt->second) {
+  if (const auto CacheIt = Cache.find(&Ptr); CacheIt != Cache.end()) {
     LLVM_DEBUG(dbgs() << "  Stored to escaping (cached), escapes\n");
+    return CacheIt->second;
+  }
+
+  if (ProcessingSet.contains(&Ptr)) { // Cycle
+    LLVM_DEBUG(dbgs() << "  Cycle detected for " << Ptr.getName()
+                      << ", assume escapes\n");
     return true;
   }
+  ProcessingSet.insert(&Ptr);
 
   // Create our custom tracker
   EscapeCaptureTracker Tracker(*this, ProcessingSet);
@@ -582,8 +581,6 @@ bool EscapeAnalysisInfo::isEscaping(const Value &Alloc) {
     MSSA = &FAM.getResult<MemorySSAAnalysis>(F).getMSSA();
   if (!LI)
     LI = &FAM.getResult<LoopAnalysis>(F);
-  if (!AA)
-    AA = &FAM.getResult<AAManager>(F);
 
   // Track allocations being processed to detect cycles
   SmallPtrSet<const Value *, 32> ProcessingSet;

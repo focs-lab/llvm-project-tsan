@@ -515,7 +515,7 @@ void ThreadSanitizer::chooseInstructionsToInstrument(
       if (const AllocaInst *AI = findAllocaForValue(Addr);
           IsEscaped && AI &&
           !PointerMayBeCaptured(AI, /*ReturnCaptures=*/true)) {
-        LLVM_DEBUG(dbgs() << "[TSan][EA] Mismatch: captured but not escaping: "
+        LLVM_DEBUG(dbgs() << "[TSan][EA] Mismatch: escaped but not captured "
                           << *AI << " in " << I->getFunction()->getName()
                           << "\n");
         report_fatal_error("TSan EA mismatch: capture implies escape");

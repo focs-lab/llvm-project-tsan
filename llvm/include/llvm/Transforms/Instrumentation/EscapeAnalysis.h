@@ -109,7 +109,6 @@ private:
 
   MemorySSA *MSSA = nullptr;
   LoopInfo *LI = nullptr;
-  AAResults *AA = nullptr;
 
   /// Checks whether a base location is externally visible (thus escapes).
   static bool isExternalObject(const Value *Base);
