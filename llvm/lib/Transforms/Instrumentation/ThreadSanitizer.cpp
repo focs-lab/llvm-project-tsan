@@ -689,13 +689,18 @@ void insertModuleCtor(Module &M) {
 
 PreservedAnalyses ThreadSanitizerPass::run(Function &F,
                                            FunctionAnalysisManager &FAM) {
-  auto *DT = ClUseDominanceAnalysis ? &FAM.getResult<DominatorTreeAnalysis>(F)
-                                    : nullptr;
-  auto *PDT = ClUseDominanceAnalysis
-                  ? &FAM.getResult<PostDominatorTreeAnalysis>(F)
-                  : nullptr;
-  auto *AA = ClUseDominanceAnalysis ? &FAM.getResult<AAManager>(F) : nullptr;
-  auto *LI = ClUseDominanceAnalysis ? &FAM.getResult<LoopAnalysis>(F) : nullptr;
+  DominatorTree *DT = nullptr;
+  PostDominatorTree *PDT = nullptr;
+  AAResults *AA = nullptr;
+  LoopInfo *LI = nullptr;
+
+  if (ClUseDominanceAnalysis) {
+    DT = &FAM.getResult<DominatorTreeAnalysis>(F);
+    PDT = &FAM.getResult<PostDominatorTreeAnalysis>(F);
+    AA = &FAM.getResult<AAManager>(F);
+    LI = &FAM.getResult<LoopAnalysis>(F);
+  }
+
 
   ThreadSanitizer TSan(FAM.getResult<TargetLibraryAnalysis>(F), DT, PDT, AA, LI);
   if (TSan.sanitizeFunction(F))
