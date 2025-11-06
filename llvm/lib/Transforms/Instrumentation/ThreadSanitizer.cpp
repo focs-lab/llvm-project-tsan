@@ -110,6 +110,18 @@ const char kTsanInitName[] = "__tsan_init";
 
 namespace {
 
+
+
+/// A bundle of optional analysis results for ThreadSanitizer pass. This
+/// simplifies the constructor interface and enables future extensibility.
+struct ThreadSanitizerAnalysisBundle {
+  // Escape analysis:
+  EscapeAnalysisInfo *EAI = nullptr;
+  MemorySSA *MSSA = nullptr;
+  LoopInfo *LI = nullptr;
+};
+
+
 /// ThreadSanitizer: instrument the code in module to find races.
 ///
 /// Instantiating ThreadSanitizer inserts the tsan runtime library API function
@@ -117,9 +129,10 @@ namespace {
 /// ensures the __tsan_init function is in the list of global constructors for
 /// the module.
 struct ThreadSanitizer {
-  ThreadSanitizer(const TargetLibraryInfo &TLI, EscapeAnalysisInfo *EAI,
-                  MemorySSA *MSSA, LoopInfo *LI)
-      : TLI(TLI), EAI(EAI), MSSA(MSSA), LI(LI) {
+  ThreadSanitizer(const TargetLibraryInfo &TLI, ThreadSanitizerAnalysisBundle &Bundle)
+      : TLI(TLI),
+        EAI(Bundle.EAI), MSSA(Bundle.MSSA), LI(Bundle.LI)
+  {
     // Check options and warn user.
     if (ClInstrumentReadBeforeWrite && ClCompoundReadBeforeWrite) {
       errs()
@@ -200,18 +213,15 @@ void insertModuleCtor(Module &M) {
 
 PreservedAnalyses ThreadSanitizerPass::run(Function &F,
                                            FunctionAnalysisManager &FAM) {
-
-  MemorySSA *MSSA = nullptr;
-  LoopInfo *LI = nullptr;
-  EscapeAnalysisInfo *EAI = nullptr;
+  ThreadSanitizerAnalysisBundle Bundle {};
 
   if (ClUseEscapeAnalysisInTSan) {
-    MSSA = &FAM.getResult<MemorySSAAnalysis>(F).getMSSA();
-    LI = &FAM.getResult<LoopAnalysis>(F);
-    EAI = &FAM.getResult<EscapeAnalysis>(F);
+    Bundle.MSSA = &FAM.getResult<MemorySSAAnalysis>(F).getMSSA();
+    Bundle.LI = &FAM.getResult<LoopAnalysis>(F);
+    Bundle.LI = &FAM.getResult<LoopAnalysis>(F);
   }
 
-  ThreadSanitizer TSan(FAM.getResult<TargetLibraryAnalysis>(F), EAI, MSSA, LI);
+  ThreadSanitizer TSan(FAM.getResult<TargetLibraryAnalysis>(F), Bundle);
   if (TSan.sanitizeFunction(F, &FAM))
     return PreservedAnalyses::none();
   return PreservedAnalyses::all();
