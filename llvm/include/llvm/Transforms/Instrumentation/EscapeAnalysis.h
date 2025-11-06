@@ -107,8 +107,10 @@ private:
   FunctionAnalysisManager &FAM;
   DenseMap<const Value *, bool> Cache;
 
+  TargetLibraryInfo *TLI = nullptr;
   MemorySSA *MSSA = nullptr;
   LoopInfo *LI = nullptr;
+  bool AnalysesInitialized = false;
 
   /// Checks whether a base location is externally visible (thus escapes).
   static bool isExternalObject(const Value *Base);

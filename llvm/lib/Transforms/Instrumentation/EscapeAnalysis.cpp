@@ -566,21 +566,21 @@ bool EscapeAnalysisInfo::isAllocationSite(const Value *V,
 }
 
 bool EscapeAnalysisInfo::isEscaping(const Value &Alloc) {
-  // Validate input
-  auto &TLI = FAM.getResult<TargetLibraryAnalysis>(F);
-  if (!isAllocationSite(&Alloc, &TLI)) {
-    LLVM_DEBUG(dbgs() << "EscapeAnalysis: Not an allocation site: "
-                      << Alloc << "\n");
+  if (!AnalysesInitialized) {
+    TLI = &FAM.getResult<TargetLibraryAnalysis>(F);
+    MSSA = &FAM.getResult<MemorySSAAnalysis>(F).getMSSA();
+    LI = &FAM.getResult<LoopAnalysis>(F);
+    AnalysesInitialized = true;
+  }
+
+  if (!isAllocationSite(&Alloc, TLI)) { // Validate input
+    LLVM_DEBUG(dbgs() << "EscapeAnalysis: Not an allocation: " << Alloc
+                      << "\n");
     return true; // Conservative: unknown things "escape"
   }
 
   LLVM_DEBUG(dbgs() << "EscapeAnalysis: Analyzing " << Alloc << "\n");
   NumAllocationsAnalyzed++;
-
-  if (!MSSA)
-    MSSA = &FAM.getResult<MemorySSAAnalysis>(F).getMSSA();
-  if (!LI)
-    LI = &FAM.getResult<LoopAnalysis>(F);
 
   // Track allocations being processed to detect cycles
   SmallPtrSet<const Value *, 32> ProcessingSet;
