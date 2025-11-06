@@ -60,7 +60,7 @@ clang_tsan_cflags = (
 tsan_enable_escape = getattr(config, "tsan_enable_escape_analysis", "False") == "True"
 if tsan_enable_escape:
     config.name += " (escape-analysis)"
-    ea_flags = [ "-mllvm", "-tsan-enable-escape-analysis" ]
+    ea_flags = [ "-mllvm", "-tsan-use-escape-analysis" ]
     clang_tsan_cflags += ea_flags
 
 clang_tsan_cxxflags = (

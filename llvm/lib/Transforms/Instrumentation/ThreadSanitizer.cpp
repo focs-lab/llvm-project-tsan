@@ -85,8 +85,8 @@ static cl::opt<bool>
     ClOmitNonCaptured("tsan-omit-by-pointer-capturing", cl::init(true),
                       cl::desc("Omit accesses due to pointer capturing"),
                       cl::Hidden);
-static cl::opt<bool> ClUseEscapeAnalysisInTSan(
-    "tsan-enable-escape-analysis", cl::init(false),
+static cl::opt<bool> ClUseEscapeAnalysis(
+    "tsan-use-escape-analysis", cl::init(false),
     cl::desc("Use EscapeAnalysis to filter memory accesses to non-escaping "
              "objects"),
     cl::Hidden);
@@ -205,7 +205,7 @@ PreservedAnalyses ThreadSanitizerPass::run(Function &F,
   LoopInfo *LI = nullptr;
   EscapeAnalysisInfo *EAI = nullptr;
 
-  if (ClUseEscapeAnalysisInTSan) {
+  if (ClUseEscapeAnalysis) {
     MSSA = &FAM.getResult<MemorySSAAnalysis>(F).getMSSA();
     LI = &FAM.getResult<LoopAnalysis>(F);
     EAI = &FAM.getResult<EscapeAnalysis>(F);
@@ -479,7 +479,7 @@ void ThreadSanitizer::chooseInstructionsToInstrument(
       }
     }
 
-    if (!ClUseEscapeAnalysisInTSan) {
+    if (!ClUseEscapeAnalysis) {
       // Instead of Addr, we should check whether its base pointer is captured.
       if (const AllocaInst *AI = findAllocaForValue(Addr);
           AI && !PointerMayBeCaptured(AI, /*ReturnCaptures=*/true) &&
@@ -493,7 +493,7 @@ void ThreadSanitizer::chooseInstructionsToInstrument(
     }
 
     // Use escape analysis if enabled
-    if (ClUseEscapeAnalysisInTSan) {
+    if (ClUseEscapeAnalysis) {
       LLVM_DEBUG(dbgs() << "[TSan][EA] Analyzing access: " << *I << "\n");
       SmallPtrSet<const Value *, 8> BaseObjs;
       bool IsComplete = false;
