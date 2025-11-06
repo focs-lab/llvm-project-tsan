@@ -258,6 +258,19 @@ private:
   LoopInfo &LI;
 };
 
+
+
+/// A bundle of optional analysis results for ThreadSanitizer pass. This
+/// simplifies the constructor interface and enables future extensibility.
+struct ThreadSanitizerAnalysisBundle {
+  // Dominance-based analysis:
+  DominatorTree *DT = nullptr;
+  PostDominatorTree *PDT = nullptr;
+  AAResults *AA = nullptr;
+  LoopInfo *LI = nullptr;
+};
+
+
 /// ThreadSanitizer: instrument the code in module to find races.
 ///
 /// Instantiating ThreadSanitizer inserts the tsan runtime library API function
@@ -265,9 +278,10 @@ private:
 /// ensures the __tsan_init function is in the list of global constructors for
 /// the module.
 struct ThreadSanitizer {
-  ThreadSanitizer(const TargetLibraryInfo &TLI, DominatorTree *DT,
-                  PostDominatorTree *PDT, AAResults *AA, LoopInfo *LI)
-      : TLI(TLI), DT(DT), PDT(PDT), AA(AA), LI(LI) {
+  ThreadSanitizer(const TargetLibraryInfo &TLI, ThreadSanitizerAnalysisBundle &Bundle )
+      : TLI(TLI),
+        DT(Bundle.DT), PDT(Bundle.PDT), AA(Bundle.AA), LI(Bundle.LI)
+  {
     // Check options and warn user.
     if (ClInstrumentReadBeforeWrite && ClCompoundReadBeforeWrite) {
       errs()
@@ -689,20 +703,17 @@ void insertModuleCtor(Module &M) {
 
 PreservedAnalyses ThreadSanitizerPass::run(Function &F,
                                            FunctionAnalysisManager &FAM) {
-  DominatorTree *DT = nullptr;
-  PostDominatorTree *PDT = nullptr;
-  AAResults *AA = nullptr;
-  LoopInfo *LI = nullptr;
+  ThreadSanitizerAnalysisBundle Bundle {};
 
   if (ClUseDominanceAnalysis) {
-    DT = &FAM.getResult<DominatorTreeAnalysis>(F);
-    PDT = &FAM.getResult<PostDominatorTreeAnalysis>(F);
-    AA = &FAM.getResult<AAManager>(F);
-    LI = &FAM.getResult<LoopAnalysis>(F);
+    Bundle.DT = &FAM.getResult<DominatorTreeAnalysis>(F);
+    Bundle.PDT = &FAM.getResult<PostDominatorTreeAnalysis>(F);
+    Bundle.AA = &FAM.getResult<AAManager>(F);
+    Bundle.LI = &FAM.getResult<LoopAnalysis>(F);
   }
 
 
-  ThreadSanitizer TSan(FAM.getResult<TargetLibraryAnalysis>(F), DT, PDT, AA, LI);
+  ThreadSanitizer TSan(FAM.getResult<TargetLibraryAnalysis>(F), Bundle);
   if (TSan.sanitizeFunction(F))
     return PreservedAnalyses::none();
   return PreservedAnalyses::all();
