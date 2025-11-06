@@ -217,7 +217,7 @@ PreservedAnalyses ThreadSanitizerPass::run(Function &F,
 
   if (ClUseEscapeAnalysisInTSan) {
     Bundle.MSSA = &FAM.getResult<MemorySSAAnalysis>(F).getMSSA();
-    Bundle.LI = &FAM.getResult<LoopAnalysis>(F);
+    Bundle.EAI = &FAM.getResult<EscapeAnalysis>(F);
     Bundle.LI = &FAM.getResult<LoopAnalysis>(F);
   }
 
