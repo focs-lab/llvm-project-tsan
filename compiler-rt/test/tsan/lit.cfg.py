@@ -50,7 +50,7 @@ else:
 tsan_incdir = config.test_source_root + "/../"
 # Setup default compiler flags used with -fsanitize=thread option.
 clang_tsan_cflags = (
-    ["-fsanitize=thread", "-mllvm", "-tsan-use-dominance-analysis", "-Wall"]
+    ["-fsanitize=thread", "-Wall"]
     + [config.target_cflags]
     + config.debug_info_flags
     + extra_cflags
