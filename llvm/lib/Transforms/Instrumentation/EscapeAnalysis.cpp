@@ -266,6 +266,7 @@ void getUnderlyingObjectsThroughLoads(const Value *Ptr, MemorySSA *MSSA,
         Clobber, Walker, LoadLoc, MAIterationLimit,
         [&](MemoryAccess *MA) -> EdgeWalkStep {
           if (MSSA->isLiveOnEntryDef(MA)) {
+            LLVM_DEBUG(dbgs() << "LiveOnEntryDef reached, fallback\n");
             Fallback = true;
             return EdgeWalkStep::Stop;
           }
@@ -441,11 +442,15 @@ bool EscapeAnalysisInfo::EscapeCaptureTracker::
                     << " ----\n");
   bool IsComplete = false;
   const auto Loads = collectLoadsReadingFromStore(Store, IsComplete);
-  if (!IsComplete)
+  if (!IsComplete) {
+    LLVM_DEBUG(dbgs() << "  Incomplete load collection, escapes\n");
     return true; // We may have missed loads -> conservatively escape
+  }
   for (const LoadInst *Load: Loads) {
-    if (!Load->isSimple() || !Load->getType()->isPointerTy())
+    if (!Load->isSimple())
       return true;
+    if (!Load->getType()->isPointerTy())
+      return false; // Loading non-pointer cannot cause escape
     if (EAI.solveEscapeFor(*Load, ProcessingSet)) {
       LLVM_DEBUG(dbgs() << "---- doesStoredPointerEscapeThroughLoads - end --> "
                            "escape\n\n");
