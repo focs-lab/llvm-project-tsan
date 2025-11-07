@@ -88,6 +88,25 @@ define void @store_to_local_ok() {
   ret void
 }
 
+; -----------------------------------------------------------------------------
+; Chain through local pointer (double indirection) remains local:
+; %x is stored in %p, %p in %pp -> no escape.
+; -----------------------------------------------------------------------------
+define void @double_ptr_local_ok() sanitize_thread {
+; CHECK-LABEL: Printing analysis 'Escape Analysis' for function 'double_ptr_local_ok':
+; CHECK:  x escapes: no
+; CHECK:  p escapes: no
+; CHECK:  pp escapes: no
+  %x  = alloca i32, align 4
+  %p  = alloca ptr, align 8
+  %pp = alloca ptr, align 8
+  store ptr %x, ptr %p
+  store ptr %p, ptr %pp
+  store i32 1, ptr %x
+  %lv = load i32, ptr %x
+  ret void
+}
+
 ; ============================================================================ ;
 ; Returns and heap allocations
 ; ============================================================================ ;
