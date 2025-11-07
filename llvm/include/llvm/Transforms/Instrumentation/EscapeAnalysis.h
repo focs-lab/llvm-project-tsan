@@ -17,11 +17,11 @@
 #define LLVM_TRANSFORMS_INSTRUMENTATION_ESCAPEANALYSIS_H
 
 #include "llvm/ADT/DenseMap.h"
-#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Analysis/CaptureTracking.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/MemorySSA.h"
+#include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/IR/PassManager.h"
 
 namespace llvm {
@@ -84,8 +84,11 @@ void getUnderlyingObjectsThroughLoads(const Value *Ptr, MemorySSA *MSSA,
 struct EscapeAnalysisInfo {
   /// Constructs an escape analysis utility for a given function.
   /// Requires a FunctionAnalysisManager to obtain other analyses like AA.
-  EscapeAnalysisInfo(Function &F, FunctionAnalysisManager &FAM)
-      : F(F), FAM(FAM) {};
+  EscapeAnalysisInfo(Function &F, FunctionAnalysisManager &FAM) : F(F) {
+    TLI = &FAM.getResult<TargetLibraryAnalysis>(F);
+    MSSA = &FAM.getResult<MemorySSAAnalysis>(F).getMSSA();
+    LI = &FAM.getResult<LoopAnalysis>(F);
+  };
   ~EscapeAnalysisInfo() = default;
 
   /// Return true if \p Alloc may escape the function.
@@ -104,13 +107,11 @@ struct EscapeAnalysisInfo {
 
 private:
   Function &F;
-  FunctionAnalysisManager &FAM;
   DenseMap<const Value *, bool> Cache;
 
   TargetLibraryInfo *TLI = nullptr;
   MemorySSA *MSSA = nullptr;
   LoopInfo *LI = nullptr;
-  bool AnalysesInitialized = false;
 
   /// Checks whether a base location is externally visible (thus escapes).
   static bool isExternalObject(const Value *Base);
@@ -154,12 +155,11 @@ private:
   /// Detect heap allocations. Required because isAllocationFn() requires
   /// the 'allockind' attribute, which older Clang versions don't generate
   /// for malloc/calloc/etc.
-  static bool isHeapAllocation(const CallBase *CB,
-                               const TargetLibraryInfo *TLI);
+  bool isHeapAllocation(const CallBase *CB);
 
   /// Helper function to detect allocation sites (malloc/new-like)
   /// Returns true if V is an Alloca or a call to a known heap alloc function.
-  static bool isAllocationSite(const Value *V, const TargetLibraryInfo *TLI);
+  bool isAllocationSite(const Value *V);
 };
 
 /// EscapeAnalysisInfo wrapper for the new pass manager.

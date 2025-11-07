@@ -17,10 +17,8 @@
 #include "llvm/Analysis/AliasAnalysis.h"
 #include "llvm/Analysis/MemoryBuiltins.h"
 #include "llvm/Analysis/MemorySSA.h"
-#include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/InstIterator.h"
-#include "llvm/IR/IntrinsicInst.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 
@@ -520,8 +518,7 @@ bool EscapeAnalysisInfo::solveEscapeFor(
 // EscapeAnalysis Core Implementation
 //===----------------------------------------------------------------------===//
 
-bool EscapeAnalysisInfo::isHeapAllocation(const CallBase *CB,
-                                          const TargetLibraryInfo *TLI) {
+bool EscapeAnalysisInfo::isHeapAllocation(const CallBase *CB) {
   // Try standard path first (works for C++ new and modern IR with allockind)
   if (isAllocationFn(CB, TLI) || isNewLikeFn(CB, TLI))
     return true;
@@ -556,24 +553,16 @@ bool EscapeAnalysisInfo::isHeapAllocation(const CallBase *CB,
     return false;
   }
 }
-bool EscapeAnalysisInfo::isAllocationSite(const Value *V,
-                                          const TargetLibraryInfo *TLI) {
+bool EscapeAnalysisInfo::isAllocationSite(const Value *V) {
   if (isa<AllocaInst>(V))
     return true;
   if (const auto *CB = dyn_cast<CallBase>(V))
-    return isHeapAllocation(CB, TLI);
+    return isHeapAllocation(CB);
   return false;
 }
 
 bool EscapeAnalysisInfo::isEscaping(const Value &Alloc) {
-  if (!AnalysesInitialized) {
-    TLI = &FAM.getResult<TargetLibraryAnalysis>(F);
-    MSSA = &FAM.getResult<MemorySSAAnalysis>(F).getMSSA();
-    LI = &FAM.getResult<LoopAnalysis>(F);
-    AnalysesInitialized = true;
-  }
-
-  if (!isAllocationSite(&Alloc, TLI)) { // Validate input
+  if (!isAllocationSite(&Alloc)) { // Validate input
     LLVM_DEBUG(dbgs() << "EscapeAnalysis: Not an allocation: " << Alloc
                       << "\n");
     return true; // Conservative: unknown things "escape"
@@ -593,13 +582,12 @@ bool EscapeAnalysisInfo::isEscaping(const Value &Alloc) {
 }
 
 void EscapeAnalysisInfo::print(raw_ostream &OS) {
-  auto &TLI = FAM.getResult<TargetLibraryAnalysis>(F);
   bool Any = false;
   unsigned UnnamedCount = 0;
 
   for (Instruction &I : instructions(F)) {
     LLVM_DEBUG(OS << "\nI: " << I << "\n");
-    if (!isAllocationSite(&I, &TLI))
+    if (!isAllocationSite(&I))
       continue;
 
     Any = true;
@@ -625,11 +613,20 @@ void EscapeAnalysisInfo::print(raw_ostream &OS) {
 
 bool EscapeAnalysisInfo::invalidate(Function &F, const PreservedAnalyses &PA,
                                     FunctionAnalysisManager::Invalidator &Inv) {
+  if (auto PAC = PA.getChecker<EscapeAnalysis>();
+      PAC.preserved() || PAC.preservedSet<AllAnalysesOn<Function>>())
+    return false;
+
   if (Inv.invalidate<MemorySSAAnalysis>(F, PA) ||
-      Inv.invalidate<LoopAnalysis>(F, PA))
+      Inv.invalidate<LoopAnalysis>(F, PA) ||
+      Inv.invalidate<TargetLibraryAnalysis>(F, PA)) {
+    Cache.clear();
+    MSSA = nullptr;
+    LI = nullptr;
+    TLI = nullptr;
     return true;
-  if (!PA.getChecker<EscapeAnalysis>().preserved())
-    return true;
+  }
+
   return false;
 }
 
