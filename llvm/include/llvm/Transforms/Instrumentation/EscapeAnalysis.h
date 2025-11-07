@@ -30,48 +30,48 @@ namespace llvm {
 // If upstream changes semantics, this must be revisited.
 static const unsigned VTMaxLookup = 0;
 
-/// A stronger variant of `llvm::getUnderlyingObjects` that uses MemorySSA
-/// to chase defining writes and, when possible, look through loads. This is
-/// more precise (and potentially more expensive) than plain ValueTracking.
+/// Find underlying base objects for a pointer possibly produced by loads.
 ///
-/// \param Ptr        A pointer-typed value to analyze.
-/// \param MSSA     A valid, up-to-date MemorySSA for V. Must not be null.
-/// \param Result   Output set that will be populated with the results.
-///                 The set is not cleared; new elements are inserted into it.
-/// \param LI       Optional LoopInfo used to improve reasoning about PHIs in
-///                 loops in ValueTracking.
+/// This routine walks backwards through MemorySSA clobbering definitions of
+/// simple loads to find stores that defined the loaded pointer values, and
+/// collects their base objects. Additionally, it attempts ValueTracking
+/// `getUnderlyingObjects` to peel pointer casts/GEPs/phis where profitable.
 ///
-/// \post
-///  - `Result` is augmented with zero or more pointer-typed "terminal
-///  sources" for `V`.
-///  - A "terminal source" is a pointer value where this analysis
-///  intentionally stops. Typical terminals include:
-///      * `AllocaInst`, `GlobalVariable`, `Argument`, `ConstantPointerNull`.
-///      * An SSA pointer value such as a `LoadInst` (or `PHINode`/`Select`
-///        as returned by ValueTracking) when MemorySSA cannot prove a precise
-///        defining write for the loaded bytes (e.g., memory is liveOnEntry,
-///        written by an opaque call, clobbered by memset/atomics/volatile,
-///        etc.).
-///      * A call result if ValueTracking stops at a call that returns a
-///      pointer
-///        (i.e., the usual terminals that `getUnderlyingObjects` would
-///        produce).
+/// Collected "base" objects are:
+///  - `AllocaInst` (stack, base=stack)
+///  - `Argument` (function argument, base=arg)
+///  - `GlobalVariable` and `GlobalAlias` (base=global|alias)
+///  - `ConstantPointerNull` (base=null)
+///  - Results of known heap-allocating calls (e.g. `malloc`, `calloc`,
+///    `realloc`, `aligned_alloc`, `strdup`, or C\+\+ `new`) when recognized
+///    via `TargetLibraryInfo` (base=heap).
 ///
-/// \note
-///  - If the analysis cannot find any sound terminal sources (e.g., due to a
-///    cycle or lack of proof), it is permitted to insert nothing. However, to
-///    match the spirit of `getUnderlyingObjects` and to keep clients
-///    predictable, when the walk stops at a pointer-typed SSA value (e.g., a
-///    `LoadInst`), this API is encouraged to insert that SSA value to
-///    represent an "unknown terminal".
-///  - The result is a may-set: `Result` contains all terminal candidates the
-///    analysis can conservatively identify, not a single precise source.
+/// If the walk encounters an unrecognized defining write, a non-simple store,
+/// a memintrinsic as a defining write, or the step budget is exceeded, the
+/// analysis conservatively treats the current value as a terminal non-base
+/// and marks the result as incomplete.
 ///
+/// Contract and guarantees:
+///  - If `MSSA` is null, the analysis immediately returns with
+///    `*IsComplete == false` (if provided).
+///  - If `TLI` is null, heap allocations cannot be recognized; terminals that
+///    are calls are treated as non-bases and lead to `*IsComplete == false`.
+///  - `Result` is a set of terminal values observed (may include non-bases if
+///    the analysis is incomplete). Use `*IsComplete` to know if all are bases.
+///  - `MaxSteps` is a per-query safety valve limiting the combined number of
+///    processed worklist nodes. When exceeded, the analysis bails out and
+///    sets `*IsComplete == false`.
 void getUnderlyingObjectsThroughLoads(const Value *Ptr, MemorySSA *MSSA,
                                       SmallPtrSetImpl<const Value *> &Result,
+                                      const TargetLibraryInfo *TLI = nullptr,
                                       LoopInfo *LI = nullptr,
                                       bool *IsComplete = nullptr,
                                       unsigned MaxSteps = 10000);
+
+/// Detect heap allocations. Required because isAllocationFn() requires
+/// the 'allockind' attribute, which older Clang versions don't generate
+/// for malloc/calloc/etc.
+bool isHeapAllocation(const CallBase *CB, const TargetLibraryInfo &TLI);
 
 /// EscapeAnalysisInfo - This class implements the actual backward dataflow
 /// analysis for a function; queries are per allocation site.
@@ -151,11 +151,6 @@ private:
   /// Solve escape for a single allocation site using backward dataflow.
   bool solveEscapeFor(const Value &Ptr,
                       SmallPtrSet<const Value *, 32> &ProcessingSet);
-
-  /// Detect heap allocations. Required because isAllocationFn() requires
-  /// the 'allockind' attribute, which older Clang versions don't generate
-  /// for malloc/calloc/etc.
-  bool isHeapAllocation(const CallBase *CB);
 
   /// Helper function to detect allocation sites (malloc/new-like)
   /// Returns true if V is an Alloca or a call to a known heap alloc function.

@@ -497,7 +497,8 @@ void ThreadSanitizer::chooseInstructionsToInstrument(
       LLVM_DEBUG(dbgs() << "[TSan][EA] Analyzing access: " << *I << "\n");
       SmallPtrSet<const Value *, 8> BaseObjs;
       bool IsComplete = false;
-      getUnderlyingObjectsThroughLoads(Addr, MSSA, BaseObjs, LI, &IsComplete);
+      getUnderlyingObjectsThroughLoads(Addr, MSSA, BaseObjs, &TLI, LI,
+                                       &IsComplete);
       bool IsEscaped = false;
       if (!IsComplete) {
         IsEscaped = true;
