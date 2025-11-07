@@ -114,6 +114,25 @@ define ptr @malloc_local_no_escape() {
   ret ptr %m2
 }
 
+; ----------------------------------------
+; Escape of malloc calls
+; ----------------------------------------
+define dso_local void @malloc_escape() #0 {
+; CHECK-LABEL: Printing analysis 'Escape Analysis' for function 'malloc_escape':
+; CHECK:   p escapes: no
+; CHECK:   call escapes: yes
+; CHECK:   call1 escapes: yes
+entry:
+  %p = alloca ptr, align 8
+  %call = call noalias ptr @malloc(i64 noundef 4) #2
+  store ptr %call, ptr @GPtr, align 8
+  %call1 = call noalias ptr @malloc(i64 noundef 4) #2
+  store ptr %call1, ptr %p, align 8
+  %0 = load ptr, ptr %p, align 8
+  store ptr %0, ptr @GPtr, align 8
+  ret void
+}
+
 ; ============================================================================ ;
 ; Globals, arguments, and mixed destinations
 ; ============================================================================ ;

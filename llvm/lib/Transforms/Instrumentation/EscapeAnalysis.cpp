@@ -138,8 +138,45 @@ static bool tryValueTracking(const Value *V, LoopInfo *LI,
   return true;
 }
 
+bool isHeapAllocation(const CallBase *CB, const TargetLibraryInfo &TLI) {
+  // Try standard path first (works for C++ new and modern IR with allockind)
+  if (isAllocationFn(CB, &TLI) || isNewLikeFn(CB, &TLI))
+    return true;
+
+  // Fallback: check directly via TLI for malloc/calloc/etc
+  const Function *Callee = CB->getCalledFunction();
+  if (!Callee || !Callee->getReturnType()->isPointerTy())
+    return false;
+
+  LibFunc Func;
+  if (!TLI.getLibFunc(*Callee, Func) || !TLI.has(Func))
+    return false;
+
+  // List of known heap allocation functions from libc
+  switch (Func) {
+  case LibFunc_malloc:
+  case LibFunc_calloc:
+  case LibFunc_realloc:
+  case LibFunc_reallocf:
+  case LibFunc_reallocarray:
+  case LibFunc_valloc:
+  case LibFunc_pvalloc:
+  case LibFunc_aligned_alloc:
+  case LibFunc_memalign:
+  case LibFunc_vec_malloc:
+  case LibFunc_vec_calloc:
+  case LibFunc_vec_realloc:
+  case LibFunc_strdup:
+  case LibFunc_strndup:
+    return true;
+  default:
+    return false;
+  }
+}
+
 void getUnderlyingObjectsThroughLoads(const Value *Ptr, MemorySSA *MSSA,
                                       SmallPtrSetImpl<const Value *> &Result,
+                                      const TargetLibraryInfo *TLI,
                                       LoopInfo *LI, bool *IsComplete,
                                       unsigned MaxSteps) {
   LLVM_DEBUG(dbgs() << "getUnderlyingObjectsThroughLoads: " << Ptr->getName()
@@ -154,9 +191,13 @@ void getUnderlyingObjectsThroughLoads(const Value *Ptr, MemorySSA *MSSA,
                          bool MarkIncompleteIfNotBase = true) {
     if (!Term || !Term->getType()->isPointerTy())
       return;
-    const bool IsBase = isa<AllocaInst>(Term) || isa<Argument>(Term) ||
-                        isa<GlobalVariable>(Term) || isa<GlobalAlias>(Term) ||
-                        isa<ConstantPointerNull>(Term);
+    bool IsBase = isa<AllocaInst>(Term) || isa<Argument>(Term) ||
+                  isa<GlobalVariable>(Term) || isa<GlobalAlias>(Term) ||
+                  isa<ConstantPointerNull>(Term);
+    if (!IsBase && TLI) {
+      if (const auto *CB = dyn_cast<CallBase>(Term))
+        IsBase = isHeapAllocation(CB, *TLI);
+    }
     LLVM_DEBUG(dbgs() << "Mark terminal: " << *Term << " IsBase="
                       << (IsBase ? "yes" : "no") << "\n");
     Result.insert(Term);
@@ -294,7 +335,7 @@ bool EscapeAnalysisInfo::EscapeCaptureTracker::doesStoreDestEscapes(
   // Find base objects for the storage location
   SmallPtrSet<const Value *, 8> BaseObjects;
   bool IsComplete = false;
-  getUnderlyingObjectsThroughLoads(Dest, EAI.MSSA, BaseObjects, EAI.LI,
+  getUnderlyingObjectsThroughLoads(Dest, EAI.MSSA, BaseObjects, EAI.TLI, EAI.LI,
                                    &IsComplete);
 
   // If bases are unknown or the walk is incomplete, be conservative.
@@ -518,46 +559,11 @@ bool EscapeAnalysisInfo::solveEscapeFor(
 // EscapeAnalysis Core Implementation
 //===----------------------------------------------------------------------===//
 
-bool EscapeAnalysisInfo::isHeapAllocation(const CallBase *CB) {
-  // Try standard path first (works for C++ new and modern IR with allockind)
-  if (isAllocationFn(CB, TLI) || isNewLikeFn(CB, TLI))
-    return true;
-
-  // Fallback: check directly via TLI for malloc/calloc/etc
-  const Function *Callee = CB->getCalledFunction();
-  if (!Callee || !Callee->getReturnType()->isPointerTy())
-    return false;
-
-  LibFunc Func;
-  if (!TLI->getLibFunc(*Callee, Func) || !TLI->has(Func))
-    return false;
-
-  // List of known heap allocation functions from libc
-  switch (Func) {
-  case LibFunc_malloc:
-  case LibFunc_calloc:
-  case LibFunc_realloc:
-  case LibFunc_reallocf:
-  case LibFunc_reallocarray:
-  case LibFunc_valloc:
-  case LibFunc_pvalloc:
-  case LibFunc_aligned_alloc:
-  case LibFunc_memalign:
-  case LibFunc_vec_malloc:
-  case LibFunc_vec_calloc:
-  case LibFunc_vec_realloc:
-  case LibFunc_strdup:
-  case LibFunc_strndup:
-    return true;
-  default:
-    return false;
-  }
-}
 bool EscapeAnalysisInfo::isAllocationSite(const Value *V) {
   if (isa<AllocaInst>(V))
     return true;
   if (const auto *CB = dyn_cast<CallBase>(V))
-    return isHeapAllocation(CB);
+    return isHeapAllocation(CB, *TLI);
   return false;
 }
 
