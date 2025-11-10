@@ -194,7 +194,7 @@ void getUnderlyingObjectsThroughLoads(const Value *Ptr, MemorySSA *MSSA,
     bool IsBase = isa<AllocaInst>(Term) || isa<Argument>(Term) ||
                   isa<GlobalVariable>(Term) || isa<GlobalAlias>(Term) ||
                   isa<ConstantPointerNull>(Term);
-    if (!IsBase && TLI) {
+    if (!IsBase && TLI) { // Check if it's heap allocation call
       if (const auto *CB = dyn_cast<CallBase>(Term))
         IsBase = isHeapAllocation(CB, *TLI);
     }
