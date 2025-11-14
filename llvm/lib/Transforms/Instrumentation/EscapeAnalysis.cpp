@@ -103,8 +103,8 @@ static void walkEdgeClobbers(MemoryAccess *Start, MemorySSAWalker *Walker,
     if (Act == EdgeWalkStep::SkipSuccessors)
       continue;
 
-    if (auto *MD = dyn_cast<MemoryDef>(MA)) {
-      MemoryAccess *EdgeCl = Walker->getClobberingMemoryAccess(MD, Loc);
+    if (auto *MDef = dyn_cast<MemoryDef>(MA)) {
+      MemoryAccess *EdgeCl = Walker->getClobberingMemoryAccess(MDef, Loc);
       if (!EdgeCl) {
         IsComplete = false;
         return;
@@ -346,6 +346,7 @@ bool EscapeAnalysisInfo::EscapeCaptureTracker::doesStoreDestEscapes(
   }
 
   for (const Value *Base : BaseObjects) {
+    LLVM_DEBUG(dbgs() << "  Store destination Base: " << *Base << "\n");
     if (isExternalObject(Base)) {
       LLVM_DEBUG(dbgs() << "  Stored to external object, escapes\n");
       return true;
@@ -358,43 +359,116 @@ bool EscapeAnalysisInfo::EscapeCaptureTracker::doesStoreDestEscapes(
         LLVM_DEBUG(dbgs() << "  Stored to escaping alloca, escapes\n");
         return true;
       }
-      continue;
+    } else if (const auto *CB = dyn_cast<CallBase>(Base)) {
+      // Store to malloc/new call result (heap allocation).
+      if (isHeapAllocation(CB, *EAI.TLI)) {
+        if (EAI.solveEscapeFor(*CB, ProcessingSet)) {
+          LLVM_DEBUG(dbgs() << "  Stored into escaping heap alloc, escapes\n");
+          return true; // Stored into escaping heap allocation — escapes.
+        }
+        continue; // Stored into non-escaping heap allocation — OK.
+      }
+      LLVM_DEBUG(dbgs() << "  Stored to unknown call result, escapes\n");
+      return true; // Unknown call result — escapes.
+    } else {
+      // Any other/unknown terminal means the destination is not proven local.
+      LLVM_DEBUG(dbgs() << "  Stored to unknown location, escapes\n");
+      return true;
     }
-    // Any other/unknown terminal means the destination is not proven local.
-    LLVM_DEBUG(dbgs() << "  Stored to unknown location: " << *Base
-                      << ", escapes\n");
-    return true;
   }
   return false;
 }
 
+SmallVector<unsigned, 8>
+EscapeAnalysisInfo::EscapeCaptureTracker::getNoCapturePointerArgIndices(
+    const CallBase *CB) const {
+  SmallVector<unsigned, 8> Indices;
+  for (unsigned ArgNo = 0, End = CB->arg_size(); ArgNo != End; ++ArgNo) {
+    const auto *Opnd = CB->getArgOperand(ArgNo);
+    if (!Opnd || !Opnd->getType()->isPointerTy() ||
+        CB->paramHasAttr(ArgNo, Attribute::WriteOnly))
+      continue;
+    CaptureInfo CI = CB->getCaptureInfo(ArgNo);
+    if (capturesNothing(
+            UseCaptureInfo(CI.getOtherComponents(), CI.getRetComponents())))
+      Indices.push_back(ArgNo);
+  }
+  return Indices;
+}
+
+bool EscapeAnalysisInfo::EscapeCaptureTracker::canEscapeViaNocaptureArgs(
+    const CallBase &CB, ArrayRef<unsigned> NoCapPtrArgs,
+    SmallPtrSetImpl<const Value *> &StorePtrOpndBases) const {
+  // For each nocapture arg, compute bases and check if it is the QueryObj.
+  for (unsigned ArgIdx : NoCapPtrArgs) {
+    const Value *OpV = CB.getArgOperand(ArgIdx);
+    SmallPtrSet<const Value *, 8> ArgBases;
+    bool Complete = false;
+    getUnderlyingObjectsThroughLoads(OpV, EAI.MSSA, ArgBases, EAI.TLI, EAI.LI,
+                                     &Complete);
+    if (!Complete)
+      return true;
+    for (const Value *StoreBaseObj: StorePtrOpndBases) {
+      if (ArgBases.contains(StoreBaseObj))
+        return true;
+    }
+  }
+  return false;
+}
+
+bool EscapeAnalysisInfo::EscapeCaptureTracker::stemsFromStartStore(
+    MemoryUseOrDef *MUOD, const MemoryDef *StartMDef, MemoryLocation Loc,
+    bool &IsComplete, MemorySSAWalker *Walker) const {
+  LLVM_DEBUG(dbgs() << "  stemsFromStartStore: clobber " << *MUOD << "\n");
+  MemoryAccess *Clobber =
+      Walker->getClobberingMemoryAccess(MUOD->getDefiningAccess(), Loc);
+  if (!Clobber) {
+    IsComplete = false;
+    return true;
+  }
+  bool WalkComplete = false;
+  bool Found = false;
+
+  walkEdgeClobbers(
+      Clobber, Walker, Loc, WorklistLimit,
+      [&](MemoryAccess *MA) {
+        LLVM_DEBUG(dbgs() << "    inspect MA: " << *MA << "\n");
+        if (MA == StartMDef) {
+          Found = true;
+          return EdgeWalkStep::Stop;
+        }
+        return EdgeWalkStep::Recurse;
+      },
+      WalkComplete);
+
+  if (!WalkComplete)
+    IsComplete = false;
+  return Found || !WalkComplete; // conservative on incompleteness
+}
+
 SmallVector<const LoadInst *, 32>
-EscapeAnalysisInfo::EscapeCaptureTracker::collectLoadsReadingFromStore(
-    const StoreInst *StartStore, bool &IsComplete) {
+EscapeAnalysisInfo::EscapeCaptureTracker::findStoreReadersAndExports(
+    const StoreInst *StartStore, bool &ContentMayEscape, bool &IsComplete) {
   IsComplete = true;
+  ContentMayEscape = false;
   auto *StartMDef = cast<MemoryDef>(EAI.MSSA->getMemoryAccess(StartStore));
   LLVM_DEBUG(dbgs() << "Collecting Loads reading from Store: " << *StartStore
                     << "\t" << *StartMDef << "\n");
   const MemoryLocation LocDest = MemoryLocation::get(StartStore);
   MemorySSAWalker *Walker = EAI.MSSA->getSkipSelfWalker();
 
-  auto doesStemFrom = [&](MemoryAccess *Clobber) -> bool {
-    bool WalkComplete = false, Found = false;
-    walkEdgeClobbers(
-        Clobber, Walker, LocDest, WorklistLimit,
-        [&](MemoryAccess *MA) {
-          LLVM_DEBUG(dbgs() << "  IsFromStart: Inspecting MA: " << *MA << "\n");
-          if (MA == StartMDef) {
-            Found = true;
-            return EdgeWalkStep::Stop;
-          }
-          return EdgeWalkStep::Recurse;
-        },
-        WalkComplete);
-    if (!WalkComplete)
-      IsComplete = false;
-    return Found || !WalkComplete;
+  // A call may export memory and cause its escape.
+  auto mayReadMemory = [](const CallBase *CB) {
+    if (!CB || CB->doesNotAccessMemory() || CB->onlyWritesMemory())
+      return false;
+    return true;
   };
+
+  // Need for nocapture arguments inquire
+  SmallPtrSet<const Value *, 8> StorePtrBases;
+  getUnderlyingObjectsThroughLoads(StartStore->getPointerOperand(),
+                                   EAI.MSSA, StorePtrBases, EAI.TLI,
+                                   EAI.LI, &IsComplete);
 
   SmallVector<const LoadInst *, 32> ResLoads;
   SmallVector<MemoryAccess *, 32> MAWorklist;
@@ -410,26 +484,30 @@ EscapeAnalysisInfo::EscapeCaptureTracker::collectLoadsReadingFromStore(
 
     MemoryAccess *MA = MAWorklist.pop_back_val();
     for (User *U : MA->users()) {
-      if (auto *MU = dyn_cast<MemoryUse>(U)) {
-        const auto *Load = dyn_cast<LoadInst>(MU->getMemoryInst());
-        if (!Load)
-          continue;
-        LLVM_DEBUG(dbgs() << "Inspecting Load: " << *Load << "\n");
-
-        MemoryAccess *Clobber =
-            Walker->getClobberingMemoryAccess(MU->getDefiningAccess(), LocDest);
-        if (!Clobber) {
-          IsComplete = false;
-          return {};
+      if (auto *MUOD = dyn_cast<MemoryUseOrDef>(U)) {
+        if (const Instruction *I = MUOD->getMemoryInst()) {
+          LLVM_DEBUG(dbgs() << "  UseOrDef: " << *I << "\n");
+          // Consider functions which can export the content behind LocDest
+          if (const auto *CB = dyn_cast<CallBase>(I); CB && mayReadMemory(CB)) {
+            if (auto NoCapArgs = getNoCapturePointerArgIndices(CB);
+                canEscapeViaNocaptureArgs(*CB, NoCapArgs, StorePtrBases) &&
+                stemsFromStartStore(MUOD, StartMDef, LocDest, IsComplete,
+                                    Walker)) {
+              LLVM_DEBUG(dbgs() << "  Call may export bytes: " << *CB << "\n");
+              ContentMayEscape = true;
+              return {};
+            }
+          } else if (auto *MU = dyn_cast<MemoryUse>(MUOD)) {
+            if (const auto *Load = dyn_cast<LoadInst>(I);
+                Load && stemsFromStartStore(MU, StartMDef, LocDest, IsComplete,
+                                            Walker)) {
+              LLVM_DEBUG(dbgs() << "  Load read from Store: " << *Load << "\n");
+              ResLoads.push_back(Load);
+            }
+            continue; // No need to enqueue further for MemoryUse
+          }
         }
-        if (!doesStemFrom(Clobber))
-          continue;
-
-        LLVM_DEBUG(dbgs() << "Found Load reading from Store: " << *Load << "\n");
-        ResLoads.push_back(Load);
-        continue;
       }
-
       tryEnqueueIfNew(cast<MemoryAccess>(U), MAVisited, MAWorklist);
     }
   }
@@ -438,26 +516,33 @@ EscapeAnalysisInfo::EscapeCaptureTracker::collectLoadsReadingFromStore(
 
 bool EscapeAnalysisInfo::EscapeCaptureTracker::
     doesStoredPointerEscapeViaLoads(const StoreInst *Store) {
-  LLVM_DEBUG(dbgs() << "\n---- doesStoredPointerEscapeThroughLoads " << *Store
+  LLVM_DEBUG(dbgs() << "\n---- doesStoredPointerEscapeViaLoads " << *Store
                     << " ----\n");
   bool IsComplete = false;
-  const auto Loads = collectLoadsReadingFromStore(Store, IsComplete);
+  bool ContentMayEscape = false;
+  const auto Loads =
+      findStoreReadersAndExports(Store, ContentMayEscape, IsComplete);
   if (!IsComplete) {
     LLVM_DEBUG(dbgs() << "  Incomplete load collection, escapes\n");
     return true; // We may have missed loads -> conservatively escape
   }
+  if (ContentMayEscape) {
+    LLVM_DEBUG(dbgs() << "  Bytes exported by call, escapes\n");
+    return true; // Bytes stored may have been exported -> conservatively escape
+  }
+
   for (const LoadInst *Load: Loads) {
     if (!Load->isSimple())
       return true;
     if (!Load->getType()->isPointerTy())
-      return false; // Loading non-pointer cannot cause escape
+      continue; // Loading non-pointer cannot cause escape
     if (EAI.solveEscapeFor(*Load, ProcessingSet)) {
-      LLVM_DEBUG(dbgs() << "---- doesStoredPointerEscapeThroughLoads - end --> "
+      LLVM_DEBUG(dbgs() << "---- doesStoredPointerEscapeViaLoads - end --> "
                            "escape\n\n");
       return true;
     }
   }
-  LLVM_DEBUG(dbgs() << "---- doesStoredPointerEscapeThroughLoads - end --> "
+  LLVM_DEBUG(dbgs() << "---- doesStoredPointerEscapeViaLoads - end --> "
                        "not escape\n\n");
   return false;
 }
@@ -487,17 +572,12 @@ EscapeAnalysisInfo::EscapeCaptureTracker::captured(const Use *U,
   if (const auto *Store = dyn_cast<StoreInst>(I)) {
     // Check if we're storing the pointer (not storing to it)
     if (Store->getValueOperand() == U->get()) {
-      LLVM_DEBUG(dbgs() << "    Storing pointer value, analyze destination "
+      LLVM_DEBUG(dbgs() << "==> Storing pointer value, analyze destination "
                         << *Store->getPointerOperand() << "\n");
       if (!Store->isSimple() ||
-          doesStoreDestEscapes(Store->getPointerOperand())) {
+          doesStoreDestEscapes(Store->getPointerOperand()) ||
+          doesStoredPointerEscapeViaLoads(Store)) {
         LLVM_DEBUG(dbgs() << "  Store to escaping destination, escapes\n");
-        Escaped = true;
-        return Stop;
-      }
-
-      LLVM_DEBUG(dbgs() << "\n   doesStoredPointerEscape " << *Store << "\n");
-      if (doesStoredPointerEscapeViaLoads(Store)) {
         Escaped = true;
         return Stop;
       }
@@ -529,11 +609,14 @@ EscapeAnalysisInfo::EscapeCaptureTracker::captured(const Use *U,
 
 bool EscapeAnalysisInfo::solveEscapeFor(
     const Value &Ptr, SmallPtrSet<const Value *, 32> &ProcessingSet) {
-  // Mark this allocation as being processed to prevent infinite recursion
-  LLVM_DEBUG(dbgs() << "============ solveEscapeFor(" << Ptr.getName()
+  LLVM_DEBUG(dbgs() << "============ solveEscapeFor("
+                    << (Ptr.hasName() ? Ptr.getName() : "Load")
                     << ") ===================\n";);
   if (const auto CacheIt = Cache.find(&Ptr); CacheIt != Cache.end()) {
-    LLVM_DEBUG(dbgs() << "  Stored to escaping (cached), escapes\n");
+    LLVM_DEBUG(dbgs() << "============ solveEscapeFor(" << Ptr.getName()
+                      << ") -- end --> "
+                      << (CacheIt->second ? " escaped " : " not escaped ")
+                      << " (cached value) ============\n";);
     return CacheIt->second;
   }
 
@@ -544,13 +627,10 @@ bool EscapeAnalysisInfo::solveEscapeFor(
   }
   ProcessingSet.insert(&Ptr);
 
-  // Create our custom tracker
   EscapeCaptureTracker Tracker(*this, ProcessingSet);
 
   // Use the CaptureTracking infrastructure to analyze the allocation
-  // We set ReturnCaptures=true because returning a pointer means it escapes
-  PointerMayBeCaptured(&Ptr, &Tracker,
-                       /*MaxUsesToExplore=*/WorklistLimit);
+  PointerMayBeCaptured(&Ptr, &Tracker, /*MaxUsesToExplore=*/WorklistLimit);
   Cache[&Ptr] = Tracker.hasEscaped();
 
   LLVM_DEBUG(dbgs() << "============ solveEscapeFor(" << Ptr.getName()

@@ -33,14 +33,6 @@ define void @no_allocs() {
   ret void
 }
 
-; Local alloca that does not escape
-define void @local_alloc_no_escape() {
-; CHECK-LABEL: Printing analysis 'Escape Analysis' for function 'local_alloc_no_escape':
-; CHECK: a escapes: no
-  %a = alloca i8, align 1
-  ret void
-}
-
 ; Using pointer in icmp -> no escape
 define void @icmp_no_escape() {
 ; CHECK-LABEL: Printing analysis 'Escape Analysis' for function 'icmp_no_escape':
@@ -133,19 +125,80 @@ entry:
   ret void
 }
 
+; Store to malloc'ed array element, which escapes -> local escapes
+define dso_local void @escape_through_malloc() {
+; CHECK-LABEL: Printing analysis 'Escape Analysis' for function 'escape_through_malloc':
+; CHECK:   a escapes: yes
+; CHECK:   x escapes: yes
+; CHECK:   b escapes: no
+; CHECK:   y escapes: yes
+; CHECK:   call escapes: yes
+; CHECK:   call1 escapes: yes
+entry:
+  %a = alloca ptr, align 8
+  %x = alloca i32, align 4
+  %b = alloca ptr, align 8
+  %y = alloca i32, align 4
+  %call = call noalias ptr @malloc(i64 noundef 80)
+  store ptr %call, ptr %a, align 8
+  store ptr %a, ptr @GPtrPtrPtr, align 8
+  %0 = load ptr, ptr %a, align 8
+  %arrayidx = getelementptr inbounds ptr, ptr %0, i64 5
+  store ptr %x, ptr %arrayidx, align 8
+  %call1 = call noalias ptr @malloc(i64 noundef 80)
+  store ptr %call1, ptr %b, align 8
+  %1 = load ptr, ptr %b, align 8
+  store ptr %1, ptr @GPtrPtr, align 8
+  %2 = load ptr, ptr %b, align 8
+  %arrayidx2 = getelementptr inbounds ptr, ptr %2, i64 5
+  store ptr %y, ptr %arrayidx2, align 8
+  ret void
+}
+
+; Store to malloc'ed array element, which does not escape -> no escape
+define dso_local void @no_escape_through_malloc() {
+; CHECK-LABEL: Printing analysis 'Escape Analysis' for function 'no_escape_through_malloc':
+; CHECK:   a escapes: no
+; CHECK:   x escapes: no
+; CHECK:   b escapes: no
+; CHECK:   y escapes: no
+; CHECK:   call escapes: no
+; CHECK:   call1 escapes: no
+entry:
+  %a = alloca ptr, align 8
+  %x = alloca i32, align 4
+  %b = alloca ptr, align 8
+  %y = alloca i32, align 4
+  %call = call noalias ptr @malloc(i64 noundef 80)
+  store ptr %call, ptr %a, align 8
+  %0 = load ptr, ptr %a, align 8
+  %arrayidx = getelementptr inbounds ptr, ptr %0, i64 5
+  store ptr %x, ptr %arrayidx, align 8
+  %call1 = call noalias ptr @malloc(i64 noundef 80)
+  store ptr %call1, ptr %b, align 8
+  %1 = load ptr, ptr %b, align 8
+  %arrayidx2 = getelementptr inbounds ptr, ptr %1, i64 5
+  store ptr %y, ptr %arrayidx2, align 8
+  ret void
+}
+
 ; ============================================================================ ;
 ; Globals, arguments, and mixed destinations
 ; ============================================================================ ;
 
-; Store to global, global alias -> escape
+; Store to global, global alias and global structure field -> escape
 define void @store_to_global_escape() {
 ; CHECK-LABEL: Printing analysis 'Escape Analysis' for function 'store_to_global_escape':
 ; CHECK: a escapes: yes
 ; CHECK: b escapes: yes
+; CHECK: c escapes: yes
   %a = alloca i8, align 1
   %b = alloca i8, align 1
+  %c = alloca i8, align 1
   store ptr %a, ptr @G
   store ptr %b, ptr @GAlias
+  %f0 = getelementptr inbounds %S, ptr @GS, i64 0, i32 0
+  store ptr %c, ptr %f0, align 8
   ret void
 }
 
@@ -198,19 +251,6 @@ f:
 m:
   %dst = phi ptr [ %p, %t ], [ @GPtr, %f ]
   store ptr %a, ptr %dst, align 8
-  ret void
-}
-
-; Store to local pointer and then store to global pointer -> escape
-define dso_local void @store_ptr_store_to_global_escape() {
-; CHECK-LABEL: Printing analysis 'Escape Analysis' for function 'store_ptr_store_to_global_escape':
-; CHECK: x escapes: yes
-; CHECK: p escapes: no
-  %x = alloca i32, align 4
-  %p = alloca ptr, align 8
-  store ptr %x, ptr %p, align 8
-  %1 = load ptr, ptr %p, align 8
-  store ptr %1, ptr @GPtr, align 8
   ret void
 }
 
@@ -279,21 +319,6 @@ define void @store_to_gep_local_ok() {
   %arr = alloca [2 x ptr], align 8
   %elem = getelementptr inbounds [2 x ptr], ptr %arr, i64 0, i64 1
   store ptr %a, ptr %elem, align 8
-  ret void
-}
-
-; Stack array element holds address of local; then that element is stored to a
-; global slot -> the local escapes, array remains local
-define void @array_element_stack_escape_via_global() {
-; CHECK-LABEL: Printing analysis 'Escape Analysis' for function 'array_element_stack_escape_via_global':
-; CHECK: a escapes: yes
-; CHECK: arr escapes: no
-  %a = alloca i8, align 1
-  %arr = alloca [2 x ptr], align 8
-  %elem = getelementptr inbounds [2 x ptr], ptr %arr, i64 0, i64 0
-  store ptr %a, ptr %elem, align 8
-  %loaded = load ptr, ptr %elem, align 8
-  store ptr %loaded, ptr @GPtr, align 8
   ret void
 }
 
@@ -397,16 +422,6 @@ define void @struct_field_local_ok() {
   ret void
 }
 
-; Store into field of a global struct -> escape
-define void @struct_field_global_escape() {
-; CHECK-LABEL: Printing analysis 'Escape Analysis' for function 'struct_field_global_escape':
-; CHECK: x escapes: yes
-  %x = alloca i8, align 1
-  %f0 = getelementptr inbounds %S, ptr @GS, i64 0, i32 0
-  store ptr %x, ptr %f0, align 8
-  ret void
-}
-
 ; Loaded-dest via field of a local struct -> no escape
 define void @loaded_dest_struct_local_ok() {
 ; CHECK-LABEL: Printing analysis 'Escape Analysis' for function 'loaded_dest_struct_local_ok':
@@ -452,20 +467,6 @@ define void @loaded_dest_struct_global_escape() {
   ret void
 }
 
-; Loaded destination: struct field points to a global slot -> escape
-define void @loaded_dest_struct_global_ptr_escape() {
-; CHECK-LABEL: Printing analysis 'Escape Analysis' for function 'loaded_dest_struct_global_ptr_escape':
-; CHECK: x escapes: yes
-; CHECK: s escapes: no
-  %x = alloca i8, align 1
-  %s = alloca %S, align 8
-  %f1 = getelementptr inbounds %S, ptr %s, i64 0, i32 1
-  store ptr @GPtr, ptr %f1, align 8
-  %l = load ptr, ptr %f1, align 8
-  store ptr %x, ptr %l, align 8
-  ret void
-}
-
 ; Select between local and global struct as container -> escape
 define void @select_struct_dest_mixed_escape(i1 %c) {
 ; CHECK-LABEL: Printing analysis 'Escape Analysis' for function 'select_struct_dest_mixed_escape':
@@ -487,6 +488,33 @@ define %S @return_struct_containing_ptr_escape() {
   %u = insertvalue %S undef, ptr %x, 0
   %u2 = insertvalue %S %u, ptr null, 1
   ret %S %u2
+}
+
+; Deep hierarchy of nested structures
+%struct.Parent = type { i32, %struct.Child }
+%struct.Child = type { i32, i32, ptr }
+%struct.GrandParent = type { i32, %struct.Parent }
+define dso_local void @escape_through_nested_struct() {
+; CHECK-LABEL: Printing analysis 'Escape Analysis' for function 'escape_through_nested_struct':
+; CHECK:  sp escapes: yes
+; CHECK:  sg escapes: yes
+; CHECK:  x escapes: yes
+entry:
+  %sp = alloca %struct.Parent, align 8
+  %sg = alloca %struct.GrandParent, align 8
+  %x = alloca i32, align 4
+  %s = getelementptr inbounds nuw %struct.Parent, ptr %sp, i32 0, i32 1
+  %a = getelementptr inbounds nuw %struct.Child, ptr %s, i32 0, i32 0
+  store ptr %a, ptr @GPtr, align 8
+  %sp1 = getelementptr inbounds nuw %struct.GrandParent, ptr %sg, i32 0, i32 1
+  %s2 = getelementptr inbounds nuw %struct.Parent, ptr %sp1, i32 0, i32 1
+  %b = getelementptr inbounds nuw %struct.Child, ptr %s2, i32 0, i32 1
+  store ptr %b, ptr @GPtr, align 8
+  %sp3 = getelementptr inbounds nuw %struct.GrandParent, ptr %sg, i32 0, i32 1
+  %s4 = getelementptr inbounds nuw %struct.Parent, ptr %sp3, i32 0, i32 1
+  %p = getelementptr inbounds nuw %struct.Child, ptr %s4, i32 0, i32 2
+  store ptr %x, ptr %p, align 8
+  ret void
 }
 
 ; ============================================================================ ;
@@ -551,7 +579,8 @@ entry:
   ret void
 }
 
-; Store p (loaded from pp) to global double pointer -> x and p escape, pp stays local
+; Store p (loaded from pp) to global double pointer
+; -> x and p escape, pp stays local
 define dso_local void @esc_thorugh_double_ptr2() {
 ; CHECK-LABEL: Printing analysis 'Escape Analysis' for function 'esc_thorugh_double_ptr2':
 ; CHECK:  x escapes: yes
@@ -568,18 +597,165 @@ entry:
   ret void
 }
 
-; Load through pp and use it to store x somewhere,
-; then leak pp’s loaded value to global double pointer
-define dso_local void @esc_thorugh_double_ptr3() {
-; CHECK-LABEL: Printing analysis 'Escape Analysis' for function 'esc_thorugh_double_ptr3':
-; CHECK:  x escapes: yes
-; CHECK:  pp escapes: no
+; ============================================================================ ;
+; Loops
+; ============================================================================ ;
+
+; Store pointer in a loop -> escape detection through loop iterations
+define void @store_in_loop_escape(i32 %n) {
+; CHECK-LABEL: Printing analysis 'Escape Analysis' for function 'store_in_loop_escape':
+; CHECK: x escapes: yes
+; CHECK: arr escapes: no
 entry:
   %x = alloca i32, align 4
-  %pp = alloca ptr, align 8
-  %0 = load ptr, ptr %pp, align 8
-  store ptr %x, ptr %0, align 8
-  %1 = load ptr, ptr %pp, align 8
-  store ptr %1, ptr @GPtrPtr, align 8
+  %arr = alloca [10 x ptr], align 8
+  br label %loop
+
+loop:
+  %i = phi i32 [ 0, %entry ], [ %next, %loop ]
+  %gep = getelementptr inbounds [10 x ptr], ptr %arr, i64 0, i32 %i
+  store ptr %x, ptr %gep, align 8
+  %next = add i32 %i, 1
+  %cond = icmp slt i32 %next, %n
+  br i1 %cond, label %loop, label %exit
+
+exit:
+  %load_gep = getelementptr inbounds [10 x ptr], ptr %arr, i64 0, i32 5
+  %loaded = load ptr, ptr %load_gep, align 8
+  store ptr %loaded, ptr @GPtr, align 8
   ret void
 }
+
+; ============================================================================ ;
+; Calls with nocapture arguments (e.g. memory intrinsics)
+; ============================================================================ ;
+
+declare void @memintr_like_func(ptr noalias readonly captures(none))
+declare void @memintr_like_func_writeonly(ptr noalias readonly captures(none)) writeonly
+declare void @memintr_like_func_arg_writeonly(ptr noalias writeonly captures(none))
+declare void @memintr_like_func_readonly(ptr noalias readonly captures(none)) readonly
+
+; Object stored into array, which is passed to a nocapture argument -> escape
+define dso_local void @pass_nocapture_arg() {
+; CHECK-LABEL: Printing analysis 'Escape Analysis' for function 'pass_nocapture_arg':
+; Case 0: store followed by nocapture argument, but writeonly -> no escape
+; CHECK:  x01 escapes: no
+; CHECK:  arr01 escapes: no
+; CHECK:  x02 escapes: no
+; CHECK:  arr02 escapes: no
+; Case 1: stored pointer is read by a nocapture-like call -> escape
+; CHECK:  x1 escapes: yes
+; CHECK:  arr1 escapes: no
+; Case 2: another independent case -> escape
+; CHECK:  x2 escapes: yes
+; CHECK:  arr2 escapes: no
+; Overwrite case below: first store is overwritten before the call -> x3 does not escape, x4 escapes
+; CHECK:  x3 escapes: no
+; CHECK:  x4 escapes: yes
+; CHECK:  arr3 escapes: no
+entry:
+  ; Case 0-1: store followed by nocapture argument, but the function is writeonly -> no escape
+  %x01 = alloca i32, align 4
+  %arr01 = alloca [10 x ptr], align 16
+  %arrayidx0 = getelementptr inbounds [10 x ptr], ptr %arr01, i64 0, i64 5
+  store ptr %x01, ptr %arrayidx0, align 8
+  %arraydecay0 = getelementptr inbounds [10 x ptr], ptr %arr01, i64 0, i64 0
+  call void @memintr_like_func_writeonly(ptr align 16 %arraydecay0)
+
+  ; Case 0-2: store followed by nocapture argument,
+  ; but the function argument is writeonly -> no escape
+  %x02 = alloca i32, align 4
+  %arr02 = alloca [10 x ptr], align 16
+  %arrayidx02 = getelementptr inbounds [10 x ptr], ptr %arr02, i64 0, i64 5
+  store ptr %x02, ptr %arrayidx02, align 8
+  %arraydecay02 = getelementptr inbounds [10 x ptr], ptr %arr02, i64 0, i64 0
+  call void @memintr_like_func_arg_writeonly(ptr align 16 %arraydecay02)
+
+  ; Case 1: stored pointer is read by a nocapture-like call -> escape
+  %x1 = alloca i32, align 4
+  %arr1 = alloca [10 x ptr], align 16
+  %arrayidx1 = getelementptr inbounds [10 x ptr], ptr %arr1, i64 0, i64 5
+  store ptr %x1, ptr %arrayidx1, align 8
+  %arraydecay1 = getelementptr inbounds [10 x ptr], ptr %arr1, i64 0, i64 0
+  call void @memintr_like_func(ptr align 16 %arraydecay1)
+
+  ; Case 2: another independent case -> escape
+  %x2 = alloca i32, align 4
+  %arr2 = alloca [10 x ptr], align 16
+  %arrayidx2 = getelementptr inbounds [10 x ptr], ptr %arr2, i64 0, i64 5
+  store ptr %x2, ptr %arrayidx2, align 8
+  %arraydecay2 = getelementptr inbounds [10 x ptr], ptr %arr2, i64 0, i64 0
+  call void @memintr_like_func_readonly(ptr align 16 %arraydecay2)
+
+  ; Case 3: Overwrite before the nocapture call:
+  ; first store (%x3) is overwritten by second store (%x4) before the call.
+  ; Expected: x3 does not escape; x4 escapes; the array itself does not escape.
+  %x3 = alloca i32, align 4
+  %x4 = alloca i32, align 4
+  %arr3 = alloca [10 x ptr], align 16
+  %slot3 = getelementptr inbounds [10 x ptr], ptr %arr3, i64 0, i64 5
+  store ptr %x3, ptr %slot3, align 8
+  store ptr %x4, ptr %slot3, align 8
+  %decay3 = getelementptr inbounds [10 x ptr], ptr %arr3, i64 0, i64 0
+  call void @memintr_like_func(ptr align 16 %decay3)
+
+  ret void
+}
+
+; Calls with nocapture arguments (heap): passing a heap pointer itself to a nocapture
+; consumer does NOT make the heap allocation escape; however, objects stored inside
+; that heap memory may escape. Includes overwrite cases for both heap pointers and x's.
+define dso_local void @pass_nocapture_arg_heap() {
+; CHECK-LABEL: Printing analysis 'Escape Analysis' for function 'pass_nocapture_arg_heap':
+; Case 1: Store local x into heap memory, then nocapture reads -> x escapes
+; CHECK:  x1 escapes: yes
+; CHECK:  arr1 escapes: no
+; CHECK:  call1 escapes: no
+; Case 2: Readonly variant -> x still escapes
+; CHECK:  x2 escapes: yes
+; CHECK:  arr2 escapes: no
+; CHECK:  call2 escapes: no
+; Case 3: Overwrite scenario for x on heap:
+; CHECK:  x3 escapes: no
+; CHECK:  x4 escapes: yes
+; CHECK:  arr3 escapes: no
+; CHECK:  call3 escapes: no
+entry:
+  ; Case 1: Store local x into heap memory, then nocapture reads -> x escapes
+  %x1 = alloca i32, align 4
+  %arr1 = alloca ptr, align 8
+  %call1 = call noalias ptr @malloc(i64 noundef 80)
+  store ptr %call1, ptr %arr1, align 8
+  %hp1 = load ptr, ptr %arr1, align 8
+  %slot1 = getelementptr inbounds ptr, ptr %hp1, i64 5
+  store ptr %x1, ptr %slot1, align 8
+  %base1 = load ptr, ptr %arr1, align 8
+  call void @memintr_like_func(ptr align 8 %base1)
+
+  ; Case 2: Readonly variant -> x still escapes
+  %x2 = alloca i32, align 4
+  %arr2 = alloca ptr, align 8
+  %call2 = call noalias ptr @malloc(i64 noundef 80)
+  store ptr %call2, ptr %arr2, align 8
+  %hp2 = load ptr, ptr %arr2, align 8
+  %slot2 = getelementptr inbounds ptr, ptr %hp2, i64 5
+  store ptr %x2, ptr %slot2, align 8
+  %base2 = load ptr, ptr %arr2, align 8
+  call void @memintr_like_func_readonly(ptr align 8 %base2)
+
+  ; Case 3: Overwrite scenario for x on heap:
+  %x3 = alloca i32, align 4
+  %x4 = alloca i32, align 4
+  %arr3 = alloca ptr, align 8
+  %call3 = call noalias ptr @malloc(i64 noundef 80)
+  store ptr %call3, ptr %arr3, align 8
+  %hp3 = load ptr, ptr %arr3, align 8
+  %slot3 = getelementptr inbounds ptr, ptr %hp3, i64 5
+  store ptr %x3, ptr %slot3, align 8
+  store ptr %x4, ptr %slot3, align 8
+  %base3 = load ptr, ptr %arr3, align 8
+  call void @memintr_like_func(ptr align 8 %base3)
+
+  ret void
+}
+

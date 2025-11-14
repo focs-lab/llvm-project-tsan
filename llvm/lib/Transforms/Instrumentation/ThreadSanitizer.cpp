@@ -517,8 +517,7 @@ void ThreadSanitizer::chooseInstructionsToInstrument(
 
 #ifndef NDEBUG // Each capture is an escape. Check it.
       if (const AllocaInst *AI = findAllocaForValue(Addr);
-          IsEscaped && AI &&
-          !PointerMayBeCaptured(AI, /*ReturnCaptures=*/true)) {
+          IsEscaped && AI && !PointerMayBeCaptured(AI, true)) {
         LLVM_DEBUG(dbgs() << "[TSan][EA] Mismatch: escaped but not captured "
                           << *AI << " in " << I->getFunction()->getName()
                           << "\n");

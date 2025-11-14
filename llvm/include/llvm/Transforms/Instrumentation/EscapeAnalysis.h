@@ -136,11 +136,27 @@ private:
     /// Analyze if storing to destination causes escape
     bool doesStoreDestEscapes(const Value *Dest);
 
-    /// Walk MemorySSA forward from StartStore and collect pointer-typed Loads
-    /// whose clobber for LocDest is reachable from StartMDef (through
-    /// MemoryPhi), i.e. the Load may read the bytes written by StartStore.
+    /// Get indices of pointer-typed arguments that are marked 'nocapture'
+    SmallVector<unsigned, 8>
+    getNoCapturePointerArgIndices(const CallBase *CB) const;
+
+    /// Check if any of the 'nocapture' arguments can reach the query object
+    bool canEscapeViaNocaptureArgs(
+        const CallBase &CB, ArrayRef<unsigned> NoCapPtrArgs,
+        SmallPtrSetImpl<const Value *> &StorePtrOpndBases) const;
+
+    /// Check if the given clobber stems from StartMDef
+    bool stemsFromStartStore(MemoryUseOrDef *MUOD, const MemoryDef *StartMDef,
+                             MemoryLocation Loc, bool &IsComplete,
+                             MemorySSAWalker *Walker) const;
+
+    /// Walk MemorySSA forward from StartStore and:
+    ///  - collect pointer-typed Loads that may read bytes written by StartStore
+    ///  - detect calls that may export those bytes via nocapture pointer args
+    /// Sets ContentMayEscape if any call may export the bytes.
     SmallVector<const LoadInst *, 32>
-    collectLoadsReadingFromStore(const StoreInst *StartStore, bool &IsComplete);
+    findStoreReadersAndExports(const StoreInst *StartStore,
+                                 bool &ContentMayEscape, bool &IsComplete);
 
     /// Analyze whether the pointer value stored by `Store` can escape
     // bool doesStoredPointerEscape(const StoreInst *Store);
