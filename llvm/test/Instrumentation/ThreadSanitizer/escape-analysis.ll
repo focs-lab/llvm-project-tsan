@@ -267,6 +267,17 @@ define dso_local void @store_ptr_store_from_global_no_escape() {
   ret void
 }
 
+declare void @varargs_func(ptr, ...)
+
+; Passing pointer to varargs -> escape
+define void @varargs_escape() {
+; CHECK-LABEL: Printing analysis 'Escape Analysis' for function 'varargs_escape':
+; CHECK: a escapes: yes
+  %a = alloca i32, align 4
+  call void (ptr, ...) @varargs_func(ptr null, ptr %a)
+  ret void
+}
+
 ; ============================================================================ ;
 ; Loaded destination patterns
 ; ============================================================================ ;
@@ -278,6 +289,24 @@ define void @store_through_loaded_arg_escape(ptr %out) {
   %a = alloca i8, align 1
   %l = load ptr, ptr %out, align 8
   store ptr %a, ptr %l, align 8
+  ret void
+}
+
+; Multiple stores to same location - last one escapes
+define void @multiple_stores_last_escapes(i1 %c) {
+; CHECK-LABEL: Printing analysis 'Escape Analysis' for function 'multiple_stores_last_escapes':
+; CHECK: x1 escapes: no
+; CHECK: x2 escapes: yes
+; CHECK: p escapes: no
+  %x1 = alloca i32, align 4
+  %x2 = alloca i32, align 4
+  %p = alloca ptr, align 8
+
+  store ptr %x1, ptr %p, align 8
+  store ptr %x2, ptr %p, align 8
+
+  %loaded = load ptr, ptr %p, align 8
+  store ptr %loaded, ptr @GPtr, align 8
   ret void
 }
 
@@ -403,6 +432,59 @@ define void @struct_heap_self_escape_via_field_addr() {
   %m = call ptr @malloc(i64 16)
   %f0 = getelementptr inbounds %S, ptr %m, i64 0, i32 0
   store ptr %f0, ptr @GPtr, align 8
+  ret void
+}
+
+; Two-dimensional heap array pointer-contained structures:
+; store local into an element, then array escapes -> local escapes; mallocs escape.
+; CHECK-LABEL: Printing analysis 'Escape Analysis' for function 'two_dimensional_array_escape':
+; CHECK:   x escapes: yes
+; CHECK:   arr escapes: no
+; CHECK:   i escapes: no
+; CHECK:   call escapes: yes
+; CHECK:   call1 escapes: yes
+define dso_local void @two_dimensional_array_escape() {
+entry:
+  %x = alloca i32, align 4
+  %arr = alloca ptr, align 8
+  %i = alloca i32, align 4
+  %call = call noalias ptr @malloc(i64 noundef 80)
+  store ptr %call, ptr %arr, align 8
+  store i32 0, ptr %i, align 4
+  br label %for.cond
+
+for.cond:                                         ; preds = %for.inc, %entry
+  %0 = load i32, ptr %i, align 4
+  %cmp = icmp slt i32 %0, 10
+  br i1 %cmp, label %for.body, label %for.end
+
+for.body:                                         ; preds = %for.cond
+  %call1 = call noalias ptr @malloc(i64 noundef 160)
+  %1 = load ptr, ptr %arr, align 8
+  %2 = load i32, ptr %i, align 4
+  %idxprom = sext i32 %2 to i64
+  %arrayidx = getelementptr inbounds ptr, ptr %1, i64 %idxprom
+  store ptr %call1, ptr %arrayidx, align 8
+  br label %for.inc
+
+for.inc:                                          ; preds = %for.body
+  %3 = load i32, ptr %i, align 4
+  %inc = add nsw i32 %3, 1
+  store i32 %inc, ptr %i, align 4
+  br label %for.cond
+
+for.end:                                          ; preds = %for.cond
+  %4 = load ptr, ptr %arr, align 8
+  %arrayidx2 = getelementptr inbounds ptr, ptr %4, i64 5
+  %5 = load ptr, ptr %arrayidx2, align 8
+  %arrayidx3 = getelementptr inbounds %S, ptr %5, i64 5
+  %f1 = getelementptr inbounds nuw %S, ptr %arrayidx3, i32 0, i32 0
+  store ptr %x, ptr %f1, align 8
+  %6 = load ptr, ptr %arr, align 8
+  %arrayidx4 = getelementptr inbounds ptr, ptr %6, i64 0
+  %7 = load ptr, ptr %arrayidx4, align 8
+  %arrayidx5 = getelementptr inbounds %S, ptr %7, i64 0
+  store ptr %arrayidx5, ptr @GPtr, align 8
   ret void
 }
 
