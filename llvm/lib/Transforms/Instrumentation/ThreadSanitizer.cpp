@@ -138,7 +138,7 @@ struct InstructionInfo {
 /// A helper class to encapsulate the logic for eliminating redundant
 /// instrumentation based on dominance analysis.
 ///
-/// This class takes a list of all memory access instructions that are candidates
+/// This class takes a list of all accesses instructions that are candidates
 /// for instrumentation. It prunes instructions that are (post-)dominated by
 /// another access to the same memory location, provided that the path between
 /// them is "clear" of any dangerous instructions (like function calls or
@@ -157,6 +157,8 @@ public:
     // Build per-function basic-block safety cache once
     if (!AllInstr.empty() && AllInstr.front().Inst) {
       Function *F = AllInstr.front().Inst->getFunction();
+      BSC.ReachableToEnd.reserve(F->size());
+      BSC.ConeSafeCache.reserve(F->size());
       buildBlockSafetyCache(*F);
     }
   }
@@ -172,14 +174,20 @@ private:
   /// Per-function precomputation cache: instruction indices within BB and
   /// positions of "dangerous" instructions.
   struct BlockSafetyCache {
+    DenseMap<const Instruction *, unsigned> IndexInBB;
+
     DenseMap<const BasicBlock *, SmallVector<unsigned, 4>> DangerIdxInBB;
     DenseMap<const BasicBlock *, bool> HasDangerInBB;
-    DenseMap<const Instruction *, unsigned> IndexInBB;
+
+    DenseMap<const BasicBlock *, SmallVector<unsigned, 4>> DangerIdxInBBPostDom;
+    DenseMap<const BasicBlock *, bool> HasDangerInBBPostDom;
+
     // Reachability cache: a set of blocks that can reach EndBB.
     DenseMap<const BasicBlock *, SmallPtrSet<const BasicBlock *, 32>>
         ReachableToEnd;
     // Cone safety cache: StartBB -> (EndBB -> pathIsSafe): to avoid custom hash
-    DenseMap<const BasicBlock *, DenseMap<const BasicBlock *, bool>>
+    DenseMap<const BasicBlock *,
+             DenseMap<const BasicBlock *, std::pair<bool, bool>>>
         ConeSafeCache;
   } BSC;
 
@@ -189,15 +197,21 @@ private:
 
   void buildBlockSafetyCache(Function &F);
 
-  /// Check that suffix (after index FromIdx) of the block contains no dangerous instruction.
-  bool suffixSafe(const BasicBlock *BB, unsigned FromIdx) const;
+  /// Check that suffix (after FromIdx) in BB contains no unsafe instruction.
+  bool suffixSafe(const BasicBlock *BB, unsigned FromIdx,
+                  const DenseMap<const BasicBlock *, SmallVector<unsigned, 4>>
+                      &DangerIdxInBB) const;
 
-  /// Check that prefix (before index ToIdx) of the block contains no dangerous instruction.
-  bool prefixSafe(const BasicBlock *BB, unsigned ToIdx) const;
+  /// Check that prefix (before ToIdx) in BB contains no unsafe instruction.
+  bool prefixSafe(const BasicBlock *BB, unsigned ToIdx,
+                  const DenseMap<const BasicBlock *, SmallVector<unsigned, 4>>
+                      &DangerIdxInBB) const;
 
-  /// Check that (FromIdx, ToExclusiveIdx) interval inside a single block is safe.
-  bool intervalSafeSameBB(const BasicBlock *BB, unsigned FromIdx,
-                          unsigned ToExclusiveIdx) const;
+  /// Check that (FromIdx, ToExclusiveIdx) interval inside a single BB is safe.
+  bool intervalSafeSameBB(
+      const BasicBlock *BB, unsigned FromIdx, unsigned ToExclusiveIdx,
+      const DenseMap<const BasicBlock *, SmallVector<unsigned, 4>>
+          &DangerIdxInBB) const;
 
   /// Checks if an instruction is "dangerous" from TSan's perspective.
   /// Dangerous instructions include function calls, atomics, and fences.
@@ -206,21 +220,26 @@ private:
   /// \return true if the instruction is dangerous.
   static bool isInstrSafe(const Instruction *Inst);
 
+  /// For post-dominance, need to check whether the path contains loops,
+  /// irregular exits or unsafe calls.
+  static bool isInstrSafeForPostDom(const Instruction *I);
+
   /// Find BBs which can reach EndBB
   SmallPtrSet<const BasicBlock *, 32> buildCanReachEnd(const BasicBlock *EndBB);
 
   /// Forward traversal from StartBB, restricted to the cone that reach EndBB.
   /// In post-dom mode additionally rejects paths that go through any loop BB.
-  template <bool IsPostDom>
-  bool traverseReachableAndCheckSafety(
+  std::pair<bool, bool> traverseReachableAndCheckSafety(
       const BasicBlock *StartBB, const BasicBlock *EndBB,
       const SmallPtrSetImpl<const BasicBlock *> &CanReachEnd);
 
   /// Checks if the path between two instructions is "clear", i.e., it does not
   /// contain any dangerous instructions that could alter the thread
   /// synchronization state.
-  /// \param StartInst The starting instruction (dominates for Dom, is dominated for PostDom).
-  /// \param EndInst The ending instruction (is dominated for Dom, post-dominates for PostDom).
+  /// \param StartInst The starting instruction (dominates for Dom, is dominated
+  /// for PostDom).
+  /// \param EndInst The ending instruction (is dominated for Dom,
+  /// post-dominates for PostDom).
   /// \param DTBase DominatorTree (for Dom) or PostDominatorTree (for PostDom).
   /// \return true if the path is clear.
   template <bool IsPostDom>
@@ -334,29 +353,43 @@ void DominanceBasedElimination::buildBlockSafetyCache(Function &F) {
   // Reserve to reduce rehashing for a typical case.
   BSC.DangerIdxInBB.reserve(F.size());
   BSC.HasDangerInBB.reserve(F.size());
-  BSC.ReachableToEnd.reserve(F.size());
-  BSC.ConeSafeCache.reserve(F.size());
+  BSC.DangerIdxInBBPostDom.reserve(F.size());
+  BSC.HasDangerInBBPostDom.reserve(F.size());
 
   for (BasicBlock &BB : F) {
     SmallVector<unsigned, 4> Danger;
+    SmallVector<unsigned, 4> DangerForPostDom;
     unsigned Idx = 0;
     for (Instruction &I : BB) {
-      BSC.IndexInBB[&I] = Idx++;
       if (!isInstrSafe(&I))
-        Danger.push_back(BSC.IndexInBB[&I]);
+        Danger.push_back(Idx);
+      if (!isInstrSafeForPostDom(&I))
+        DangerForPostDom.push_back(Idx);
+      BSC.IndexInBB[&I] = Idx++;
     }
     BSC.HasDangerInBB[&BB] = !Danger.empty();
     // Already in order by linear scan.
     BSC.DangerIdxInBB[&BB] = std::move(Danger);
+
+    BSC.HasDangerInBBPostDom[&BB] = !DangerForPostDom.empty();
+
+    // Additional check for postdom: if the path contains loops
+    if (LI.getLoopFor(&BB) != nullptr) {
+      BSC.HasDangerInBBPostDom[&BB] = true;
+      DangerForPostDom.push_back(BB.size() - 1);
+    }
+    BSC.DangerIdxInBBPostDom[&BB] = std::move(DangerForPostDom);
   }
 }
 
 // Check that suffix (after index FromIdx) in the BB contains no dangerous
 // instruction.
-bool DominanceBasedElimination::suffixSafe(const BasicBlock *BB,
-                                           unsigned FromIdx) const {
-  const auto It = BSC.DangerIdxInBB.find(BB);
-  if (It == BSC.DangerIdxInBB.end() || It->second.empty())
+bool DominanceBasedElimination::suffixSafe(
+    const BasicBlock *BB, unsigned FromIdx,
+    const DenseMap<const BasicBlock *, SmallVector<unsigned, 4>> &DangerIdxInBB)
+    const {
+  const auto It = DangerIdxInBB.find(BB);
+  if (It == DangerIdxInBB.end() || It->second.empty())
     return true;
   const auto &DangerIdx = It->second;
   // First dangerous index >= FromIdx?
@@ -366,10 +399,12 @@ bool DominanceBasedElimination::suffixSafe(const BasicBlock *BB,
 
 // Check that prefix (before index ToIdx) of the BB contains no dangerous
 // instruction.
-bool DominanceBasedElimination::prefixSafe(const BasicBlock *BB,
-                                           unsigned ToIdx) const {
-  const auto It = BSC.DangerIdxInBB.find(BB);
-  if (It == BSC.DangerIdxInBB.end() || It->second.empty())
+bool DominanceBasedElimination::prefixSafe(
+    const BasicBlock *BB, unsigned ToIdx,
+    const DenseMap<const BasicBlock *, SmallVector<unsigned, 4>> &DangerIdxInBB)
+    const {
+  const auto It = DangerIdxInBB.find(BB);
+  if (It == DangerIdxInBB.end() || It->second.empty())
     return true;
   const auto &DangerIdx = It->second;
   // Any dangerous index < ToIdx?
@@ -378,9 +413,11 @@ bool DominanceBasedElimination::prefixSafe(const BasicBlock *BB,
 }
 
 bool DominanceBasedElimination::intervalSafeSameBB(
-    const BasicBlock *BB, unsigned FromIdx, unsigned ToExclusiveIdx) const {
-  const auto It = BSC.DangerIdxInBB.find(BB);
-  if (It == BSC.DangerIdxInBB.end() || It->second.empty())
+    const BasicBlock *BB, unsigned FromIdx, unsigned ToExclusiveIdx,
+    const DenseMap<const BasicBlock *, SmallVector<unsigned, 4>> &DangerIdxInBB)
+    const {
+  const auto It = DangerIdxInBB.find(BB);
+  if (It == DangerIdxInBB.end() || It->second.empty())
     return true;
   const auto &DangerIdx = It->second;
   const auto LB = std::lower_bound(DangerIdx.begin(), DangerIdx.end(), FromIdx);
@@ -416,6 +453,27 @@ bool DominanceBasedElimination::isInstrSafe(const Instruction *Inst) {
   return true;
 }
 
+bool DominanceBasedElimination::isInstrSafeForPostDom(const Instruction *I) {
+  // Irregular exits (e.g. return, abort, exceptions) and function calls
+  // (potential infinite loops) make post-dominance elimination unsafe.
+  if (isa<ReturnInst>(I) || isa<ResumeInst>(I))
+    return false;
+
+  if (const auto *CB = dyn_cast<CallBase>(I)) {
+    // Intrinsics are generally safe (no loops/exits hidden inside).
+    if (isa<IntrinsicInst>(CB))
+      return true;
+
+    if (const Function *Callee = CB->getCalledFunction()) {
+      if (Callee->hasFnAttribute(Attribute::WillReturn) &&
+          Callee->hasFnAttribute(Attribute::NoUnwind))
+        return true;
+    }
+    return false;
+  }
+  return true;
+}
+
 SmallPtrSet<const BasicBlock *, 32>
 DominanceBasedElimination::buildCanReachEnd(const BasicBlock *EndBB) {
   // Check the cache first.
@@ -438,13 +496,13 @@ DominanceBasedElimination::buildCanReachEnd(const BasicBlock *EndBB) {
     }
   }
 
-  // Store in the cache and return a copy (DenseMap stores the value internally).
+  // Store in the cache and return a copy.
   BSC.ReachableToEnd[EndBB] = CanReachSet;
   return BSC.ReachableToEnd[EndBB];
 }
 
-template <bool IsPostDom>
-bool DominanceBasedElimination::traverseReachableAndCheckSafety(
+std::pair<bool, bool>
+DominanceBasedElimination::traverseReachableAndCheckSafety(
     const BasicBlock *StartBB, const BasicBlock *EndBB,
     const SmallPtrSetImpl<const BasicBlock *> &CanReachEnd) {
   Worklist.clear();
@@ -455,31 +513,35 @@ bool DominanceBasedElimination::traverseReachableAndCheckSafety(
       Worklist.push_back(BB);
   };
 
-  for (const BasicBlock *Succ : successors(StartBB))
+  for (const BasicBlock *Succ : successors(StartBB)) {
     if (CanReachEnd.count(Succ))
       enqueueNonVisited(Succ);
+  }
+
+  bool DomSafety = true, PostDomSafety = true;
 
   while (!Worklist.empty()) {
     const BasicBlock *BB = Worklist.pop_back_val();
+    LLVM_DEBUG(dbgs() << "Checking BB: " << BB->getName() << "\n");
 
     // Post-dom safety: any intermediate BB that is part of a loop
     // makes elimination unsafe (potential infinite loop).
-    if constexpr (IsPostDom) {
-      if (!ClPostDomAggressive &&
-          LI.getLoopFor(BB) != nullptr) {
-        return false;
-      }
-    }
+    if (!ClPostDomAggressive && PostDomSafety &&
+        BSC.HasDangerInBBPostDom.lookup(BB))
+      PostDomSafety = false;
 
     // Any dangerous instruction in an intermediate BB makes the path “dirty”.
-    if (BSC.HasDangerInBB.lookup(BB))
-      return false;
+    if (DomSafety && BSC.HasDangerInBB.lookup(BB))
+      DomSafety = false;
+
+    if (!DomSafety && !PostDomSafety)
+      break;
 
     for (const BasicBlock *Succ : successors(BB))
       if (CanReachEnd.contains(Succ))
         enqueueNonVisited(Succ);
   }
-  return true;
+  return {DomSafety, PostDomSafety};
 }
 
 template <bool IsPostDom>
@@ -496,21 +558,38 @@ bool DominanceBasedElimination::isPathClear(
   const unsigned EndIdx = BSC.IndexInBB.lookup(EndInst);
 
   // Intra-BB: verify (StartInst; EndInst) is safe.
-  if (StartBB == EndBB)
-    return intervalSafeSameBB(StartBB, StartIdx + 1, EndIdx);
+  if (StartBB == EndBB) {
+    bool DomSafety =
+        intervalSafeSameBB(StartBB, StartIdx + 1, EndIdx, BSC.DangerIdxInBB);
+    if constexpr (IsPostDom) {
+      return DomSafety && intervalSafeSameBB(StartBB, StartIdx + 1, EndIdx,
+                                             BSC.DangerIdxInBBPostDom);
+    }
+    return DomSafety;
+  }
 
   // Quick local checks on edges.
-  if (!suffixSafe(StartBB, StartIdx + 1) || !prefixSafe(EndBB, EndIdx))
+  bool DomSafety = suffixSafe(StartBB, StartIdx + 1, BSC.DangerIdxInBB) &&
+                   prefixSafe(EndBB, EndIdx, BSC.DangerIdxInBB);
+  if (!DomSafety)
     return false;
+  if constexpr (IsPostDom) {
+    bool PostDomSafety =
+        suffixSafe(StartBB, StartIdx + 1, BSC.DangerIdxInBBPostDom) &&
+        prefixSafe(EndBB, EndIdx, BSC.DangerIdxInBBPostDom);
+    if (!PostDomSafety)
+      return false;
+  }
 
   // Cone safety cache lookup.
   if (const auto OuterIt = BSC.ConeSafeCache.find(StartBB);
       OuterIt != BSC.ConeSafeCache.end()) {
     if (const auto InnerIt = OuterIt->second.find(EndBB);
         InnerIt != OuterIt->second.end()) {
-      LLVM_DEBUG(dbgs() << "isPathClear (cached cone): "
-                        << (InnerIt->second ? "true" : "false") << "\n");
-      return InnerIt->second;
+      const auto &[DomSafe, PostDomSafe] = InnerIt->second;
+      if (IsPostDom)
+        return DomSafe && PostDomSafe;
+      return DomSafe;
     }
   }
 
@@ -518,10 +597,14 @@ bool DominanceBasedElimination::isPathClear(
   const auto CanReachEnd = buildCanReachEnd(EndBB);
 
   // Forward traversal from StartBB, restricted to the cone that reach EndBB.
-  const bool Res = traverseReachableAndCheckSafety<IsPostDom>(StartBB, EndBB, CanReachEnd);
-  BSC.ConeSafeCache[StartBB][EndBB] = Res;
-  LLVM_DEBUG(dbgs() << "isPathClear: " << (Res ? "true" : "false") << "\n");
-  return Res;
+  const auto [DomSafe, PostDomSafe] = traverseReachableAndCheckSafety(StartBB, EndBB, CanReachEnd);
+  BSC.ConeSafeCache[StartBB][EndBB] = {DomSafe, PostDomSafe};
+  LLVM_DEBUG(dbgs() << "isPathClear (DomSafe): " << (DomSafe ? "true" : "false")
+                    << "\nisPathClear (PostDomSafe): "
+                    << (PostDomSafe ? "true" : "false") << "\n");
+  if constexpr (IsPostDom)
+    return DomSafe && PostDomSafe;
+  return DomSafe;
 }
 
 DenseMap<Instruction *, size_t>
@@ -701,8 +784,8 @@ PreservedAnalyses ThreadSanitizerPass::run(Function &F,
     LI = &FAM.getResult<LoopAnalysis>(F);
   }
 
-
-  ThreadSanitizer TSan(FAM.getResult<TargetLibraryAnalysis>(F), DT, PDT, AA, LI);
+  ThreadSanitizer TSan(FAM.getResult<TargetLibraryAnalysis>(F), DT, PDT, AA,
+                       LI);
   if (TSan.sanitizeFunction(F))
     return PreservedAnalyses::none();
   return PreservedAnalyses::all();

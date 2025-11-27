@@ -13,7 +13,7 @@ target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f3
 
 ; --- External Function Declarations for Tests ---
 declare void @some_external_call()
-declare void @llvm.donothing() #0
+declare void @safe_func() #0
 declare void @external_check()
 
 ; =============================================================================
@@ -76,7 +76,7 @@ entry:
 define void @test_path_clear_safe_call() nounwind uwtable sanitize_thread {
 entry:
   store i32 1, ptr @g1, align 4
-  call void @llvm.donothing()
+  call void @safe_func()
   store i32 2, ptr @g1, align 4
   ret void
 }
@@ -293,7 +293,7 @@ then:
   br label %merge
 
 else:
-  call void @llvm.donothing()
+  call void @safe_func()
   br label %merge
 
 merge:
@@ -315,11 +315,11 @@ entry:
   br i1 %cond, label %then, label %else
 
 then:
-  call void @llvm.donothing()
+  call void @safe_func()
   br label %merge
 
 else:
-  call void @llvm.donothing()
+  call void @safe_func()
   br label %merge
 
 merge:
@@ -351,7 +351,7 @@ dirty:
 
 clean:
   ; safe on other path
-  call void @llvm.donothing()
+  call void @safe_func()
   br label %merge
 
 merge:
@@ -481,5 +481,60 @@ while.end:                                        ; preds = %while.cond
 ; CHECK:       while.end:
 ; CHECK:       call void @__tsan_write4(ptr @g1)
 
-; Attributes for the "safe" intrinsic
-attributes #0 = { nounwind readnone }
+; =============================================================================
+; POST-DOMINANCE BLOCKED BY POTENTIAL INFINITE LOOP (CallBase check)
+; =============================================================================
+
+declare void @dom_safe_but_postdom_unsafe() #0
+
+define void @test_post_dom_blocked_by_readnone_call(i1 %cond) nounwind uwtable sanitize_thread {
+entry:
+  br i1 %cond, label %if.then, label %if.else
+if.then:
+  ; dominated by neither entry nor if.end (in terms of domination elimination flow)
+  ; but post-dominated by if.end
+  store i32 1, ptr @g1, align 4
+  call void @dom_safe_but_postdom_unsafe()
+  br label %if.end
+if.else:
+  br label %if.end
+if.end:
+  store i32 2, ptr @g1, align 4
+  ret void
+}
+; CHECK-LABEL: define void @test_post_dom_blocked_by_readnone_call
+; CHECK:       if.then:
+; The call is readnone (safe for sync) but not an intrinsic (unsafe for termination).
+; So the first write must NOT be eliminated (post-dominance is blocked).
+; CHECK:       call void @__tsan_write4(ptr @g1)
+; CHECK:       call void @dom_safe_but_postdom_unsafe()
+; CHECK:       if.end:
+; CHECK:       call void @__tsan_write4(ptr @g1)
+; CHECK:       ret void
+
+declare void @postdom_safe_func() #1
+
+define void @test_post_dom_allowed_by_postdome_safe_func(i1 %cond) nounwind uwtable sanitize_thread {
+entry:
+  br i1 %cond, label %if.then, label %if.else
+if.then:
+  store i32 1, ptr @g1, align 4
+  call void @postdom_safe_func()
+  br label %if.end
+if.else:
+  br label %if.end
+if.end:
+  store i32 2, ptr @g1, align 4
+  ret void
+}
+; CHECK-LABEL: define void @test_post_dom_allowed_by_postdome_safe_func
+; CHECK:       if.then:
+; CHECK-NOT:   call void @__tsan_write4(ptr @g1)
+; CHECK:       call void @postdom_safe_func()
+; CHECK:       if.end:
+; CHECK:       call void @__tsan_write4(ptr @g1)
+; CHECK:       ret void
+
+; Attributes for the "safe" function
+attributes #0 = { nosync }
+attributes #1 = { nosync willreturn nounwind }
