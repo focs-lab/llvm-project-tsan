@@ -25,11 +25,6 @@
 #include "llvm/IR/PassManager.h"
 
 namespace llvm {
-
-// getUnderlyingObjects(..., MaxLookup = 0) is assumed to mean "unbounded".
-// If upstream changes semantics, this must be revisited.
-static const unsigned VTMaxLookup = 0;
-
 /// Find underlying base objects for a pointer possibly produced by loads.
 ///
 /// This routine walks backwards through MemorySSA clobbering definitions of
@@ -68,9 +63,8 @@ void getUnderlyingObjectsThroughLoads(const Value *Ptr, MemorySSA *MSSA,
                                       bool *IsComplete = nullptr,
                                       unsigned MaxSteps = 10000);
 
-/// Detect heap allocations. Required because isAllocationFn() requires
-/// the 'allockind' attribute, which older Clang versions don't generate
-/// for malloc/calloc/etc.
+/// Detect heap allocations. Complements isAllocationFn() by checking
+/// library functions directly when attributes might be missing.
 bool isHeapAllocation(const CallBase *CB, const TargetLibraryInfo &TLI);
 
 /// EscapeAnalysisInfo - This class implements the actual backward dataflow
@@ -134,7 +128,7 @@ private:
     bool Escaped = false;
 
     /// Analyze if storing to destination causes escape
-    bool doesStoreDestEscapes(const Value *Dest);
+    bool doesStoreDestEscape(const Value *Dest);
 
     /// Get indices of pointer-typed arguments that are marked 'nocapture'
     SmallVector<unsigned, 8>
@@ -159,8 +153,6 @@ private:
                                  bool &ContentMayEscape, bool &IsComplete);
 
     /// Analyze whether the pointer value stored by `Store` can escape
-    // bool doesStoredPointerEscape(const StoreInst *Store);
-    // bool doesStoredPointerEscape2(const StoreInst *Store);
     bool doesStoredPointerEscapeViaLoads(const StoreInst *Store);
   };
 

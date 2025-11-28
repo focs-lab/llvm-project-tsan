@@ -22,8 +22,6 @@
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 
-#include <deque>
-
 #define DEBUG_TYPE "escape-analysis"
 
 using namespace llvm;
@@ -38,6 +36,10 @@ static cl::opt<unsigned>
 WorklistLimit("escape-analysis-worklist-limit", cl::init(1000), cl::Hidden,
               cl::desc("Max number of worklist nodes processed per allocation; "
                        "if exceeded, assume the allocation escapes"));
+
+// getUnderlyingObjects(..., MaxLookup = 0) is assumed to mean "unbounded".
+// If upstream changes semantics, this must be revisited.
+static const unsigned VTMaxLookup = 0;
 
 //===----------------------------------------------------------------------===//
 // MemorySSA-related utils
@@ -187,6 +189,13 @@ void getUnderlyingObjectsThroughLoads(const Value *Ptr, MemorySSA *MSSA,
     return; // Only pointers have underlying objects.
   }
 
+  if (!MSSA) {
+    LLVM_DEBUG(dbgs() << "MSSA is null, marking analysis as incomplete\n");
+    if (IsComplete)
+      *IsComplete = false;
+    return;
+  }
+
   auto addTerminal = [&](const Value *Term,
                          bool MarkIncompleteIfNotBase = true) {
     if (!Term || !Term->getType()->isPointerTy())
@@ -331,7 +340,7 @@ bool EscapeAnalysisInfo::isExternalObject(const Value *Base) {
          isa<Argument>(Base);
 }
 
-bool EscapeAnalysisInfo::EscapeCaptureTracker::doesStoreDestEscapes(
+bool EscapeAnalysisInfo::EscapeCaptureTracker::doesStoreDestEscape(
     const Value *Dest) {
   // Find base objects for the storage location
   SmallPtrSet<const Value *, 8> BaseObjects;
@@ -537,13 +546,11 @@ bool EscapeAnalysisInfo::EscapeCaptureTracker::
     if (!Load->getType()->isPointerTy())
       continue; // Loading non-pointer cannot cause escape
     if (EAI.solveEscapeFor(*Load, ProcessingSet)) {
-      LLVM_DEBUG(dbgs() << "---- doesStoredPointerEscapeViaLoads - end --> "
-                           "escape\n\n");
+      LLVM_DEBUG(dbgs() << "  -> escapes via load\n");
       return true;
     }
   }
-  LLVM_DEBUG(dbgs() << "---- doesStoredPointerEscapeViaLoads - end --> "
-                       "not escape\n\n");
+  LLVM_DEBUG(dbgs() << "  -> does not escape via loads\n");
   return false;
 }
 
@@ -575,7 +582,7 @@ EscapeAnalysisInfo::EscapeCaptureTracker::captured(const Use *U,
       LLVM_DEBUG(dbgs() << "==> Storing pointer value, analyze destination "
                         << *Store->getPointerOperand() << "\n");
       if (!Store->isSimple() ||
-          doesStoreDestEscapes(Store->getPointerOperand()) ||
+          doesStoreDestEscape(Store->getPointerOperand()) ||
           doesStoredPointerEscapeViaLoads(Store)) {
         LLVM_DEBUG(dbgs() << "  Store to escaping destination, escapes\n");
         Escaped = true;
@@ -600,23 +607,16 @@ EscapeAnalysisInfo::EscapeCaptureTracker::captured(const Use *U,
     return Stop;
   }
 
-#ifndef NDEBUG
   llvm_unreachable("Unhandled case in EscapeCaptureTracker::captured");
-#else
-  return Continue;
-#endif
 }
 
 bool EscapeAnalysisInfo::solveEscapeFor(
     const Value &Ptr, SmallPtrSet<const Value *, 32> &ProcessingSet) {
-  LLVM_DEBUG(dbgs() << "============ solveEscapeFor("
-                    << (Ptr.hasName() ? Ptr.getName() : "Load")
-                    << ") ===================\n";);
+  LLVM_DEBUG(dbgs() << "Solving escape for "
+                  << (Ptr.hasName() ? Ptr.getName() : "Load") << "\n");
   if (const auto CacheIt = Cache.find(&Ptr); CacheIt != Cache.end()) {
-    LLVM_DEBUG(dbgs() << "============ solveEscapeFor(" << Ptr.getName()
-                      << ") -- end --> "
-                      << (CacheIt->second ? " escaped " : " not escaped ")
-                      << " (cached value) ============\n";);
+    LLVM_DEBUG(dbgs() << "  Cached result: "
+                  << (CacheIt->second ? "escaped" : "not escaped") << "\n");
     return CacheIt->second;
   }
 
@@ -633,10 +633,8 @@ bool EscapeAnalysisInfo::solveEscapeFor(
   PointerMayBeCaptured(&Ptr, &Tracker, /*MaxUsesToExplore=*/WorklistLimit);
   Cache[&Ptr] = Tracker.hasEscaped();
 
-  LLVM_DEBUG(dbgs() << "============ solveEscapeFor(" << Ptr.getName()
-                    << ") -- end --> "
-                    << (Tracker.hasEscaped() ? " escaped " : " not escaped ")
-                    << " ============\n";);
+  LLVM_DEBUG(dbgs() << "  Result: "
+                        << (Tracker.hasEscaped() ? "escaped" : "not escaped") << "\n");
   return Tracker.hasEscaped();
 }
 
