@@ -91,7 +91,7 @@ static cl::opt<bool>
 static cl::opt<bool>
     ClUseDominanceAnalysis("tsan-use-dominance-analysis", cl::init(false),
                            cl::desc("Eliminate duplicating instructions which "
-                                    "(post)dominates given instruction"),
+                                    "(post)dominate given instruction"),
                            cl::Hidden);
 static cl::opt<bool> ClPostDomAggressive(
     "tsan-postdom-aggressive", cl::init(false),
@@ -264,8 +264,7 @@ private:
 
   /// The core elimination logic. Templated to work with both Dominators
   /// and Post-Dominators.
-  template <bool IsPostDom>
-  void eliminate();
+  template <bool IsPostDom> void eliminate();
 
   /// A reference to the vector of instructions that we modify.
   SmallVectorImpl<InstructionInfo> &AllInstr;
@@ -522,7 +521,6 @@ DominanceBasedElimination::traverseReachableAndCheckSafety(
 
   while (!Worklist.empty()) {
     const BasicBlock *BB = Worklist.pop_back_val();
-    LLVM_DEBUG(dbgs() << "Checking BB: " << BB->getName() << "\n");
 
     // Post-dom safety: any intermediate BB that is part of a loop
     // makes elimination unsafe (potential infinite loop).
@@ -698,17 +696,12 @@ bool DominanceBasedElimination::findAndMarkDominatingInstr(
 
 /// Eliminates redundant instrumentation based on (pre/post)dominance analysis.
 /// \tparam IsPostDom If true, uses post-dominance; if false, uses dominance.
-///   Dom mode: DomInst dominates CurrInst (path: Dom → Curr)
-///   PostDom mode: CurrInst post-dominates DomInst (path: Curr → Dom)
-template <bool IsPostDom>
-void DominanceBasedElimination::eliminate() {
-  LLVM_DEBUG(dbgs() << "====================================\n=== Starting "
-                    << (IsPostDom ? "post-" : "")
-                    << "dominance-based analysis ===\n");
+template <bool IsPostDom> void DominanceBasedElimination::eliminate() {
+  LLVM_DEBUG(dbgs() << "Starting " << (IsPostDom ? "post-" : "")
+                    << "dominance-based analysis\n");
   if (AllInstr.empty())
     return;
 
-  // DominatorTreeBase<BasicBlock, IsPostDom> &DTBase = IsPostDom ? PDT : DT;
   DominatorTreeBase<BasicBlock, IsPostDom> *DTBase;
   if constexpr (IsPostDom)
     DTBase = &PDT;
@@ -730,11 +723,10 @@ void DominanceBasedElimination::eliminate() {
       RemovedCount++;
   }
 
-  LLVM_DEBUG(
-      dbgs() << "\n=== Final list of instructions and their status ===\n";
-      for (size_t i = 0; i < AllInstr.size(); ++i) dbgs()
-      << "[" << (ToRemove[i] ? "REMOVED" : "KEPT") << "]\t" << *AllInstr[i].Inst
-      << "\n");
+  LLVM_DEBUG(dbgs() << "\nFinal list of instructions and their status\n";
+             for (size_t i = 0; i < AllInstr.size(); ++i) dbgs()
+             << "[" << (ToRemove[i] ? "REMOVED" : "KEPT") << "]\t"
+             << *AllInstr[i].Inst << "\n");
 
   if (RemovedCount > 0) {
     LLVM_DEBUG(dbgs() << "\n=== Updating final instruction list ===\n"
@@ -748,12 +740,11 @@ void DominanceBasedElimination::eliminate() {
     });
 
     if constexpr (IsPostDom)
-      NumOmittedByPostDominance += RemovedCount; // Statistics
+      NumOmittedByPostDominance += RemovedCount;
     else
-      NumOmittedByDominance += RemovedCount; // Statistics
+      NumOmittedByDominance += RemovedCount;
   }
-  LLVM_DEBUG(dbgs() << "=== Dominance analysis complete ===\n"
-                    << "===========================================\n");
+  LLVM_DEBUG(dbgs() << "Dominance analysis complete\n");
 }
 
 //-----------------------------------------------------------------------------
