@@ -50,6 +50,9 @@ using namespace llvm;
 
 #define DEBUG_TYPE "tsan"
 
+static cl::opt<bool> ClEnableL0Filter(
+    "tsan-enable-l0", cl::init(true), cl::Hidden,
+    cl::desc("Enable the custom inline L0 cache filter for TSan"));
 static cl::opt<bool> ClInstrumentMemoryAccesses(
     "tsan-instrument-memory-accesses", cl::init(true),
     cl::desc("Instrument memory accesses"), cl::Hidden);
@@ -101,6 +104,10 @@ const char kTsanModuleCtorName[] = "tsan.module_ctor";
 const char kTsanInitName[] = "__tsan_init";
 
 namespace {
+
+static llvm::GlobalVariable *L0FilterGlobal = nullptr;
+static llvm::GlobalVariable *LocalEpochGlobal = nullptr;
+static llvm::ArrayType *CacheArrayTy = nullptr;
 
 /// ThreadSanitizer: instrument the code in module to find races.
 ///
@@ -182,7 +189,7 @@ void insertModuleCtor(Module &M) {
       // time. Hook them into the global ctors list in that case:
       [&](Function *Ctor, FunctionCallee) { appendToGlobalCtors(M, Ctor, 0); });
 }
-}  // namespace
+} // namespace
 
 PreservedAnalyses ThreadSanitizerPass::run(Function &F,
                                            FunctionAnalysisManager &FAM) {
@@ -194,6 +201,28 @@ PreservedAnalyses ThreadSanitizerPass::run(Function &F,
 
 PreservedAnalyses ModuleThreadSanitizerPass::run(Module &M,
                                                  ModuleAnalysisManager &MAM) {
+
+  LLVMContext &Ctx = M.getContext();
+  Type *Int64Ty = Type::getInt64Ty(Ctx);
+
+  CacheArrayTy = ArrayType::get(Int64Ty, 4096);
+
+  L0FilterGlobal = M.getGlobalVariable("TSanL0Filter");
+  if (!L0FilterGlobal) {
+    L0FilterGlobal = new GlobalVariable(
+        M, CacheArrayTy, false, GlobalValue::InternalLinkage,
+        ConstantAggregateZero::get(CacheArrayTy), "TSanL0Filter", nullptr,
+        GlobalValue::ThreadLocalMode::GeneralDynamicTLSModel);
+  }
+
+  LocalEpochGlobal = M.getGlobalVariable("TSanLocalEpoch");
+  if (!LocalEpochGlobal) {
+    LocalEpochGlobal = new GlobalVariable(
+        M, Int64Ty, false, GlobalValue::InternalLinkage,
+        ConstantInt::get(Int64Ty, 1), "TSanLocalEpoch", nullptr,
+        GlobalValue::ThreadLocalMode::GeneralDynamicTLSModel);
+  }
+
   // Return early if nosanitize_thread module flag is present for the module.
   if (checkIfAlreadyInstrumented(M, "nosanitize_thread"))
     return PreservedAnalyses::all();
@@ -224,12 +253,12 @@ void ThreadSanitizer::initialize(Module &M, const TargetLibraryInfo &TLI) {
     std::string ByteSizeStr = utostr(ByteSize);
     std::string BitSizeStr = utostr(BitSize);
     SmallString<32> ReadName("__tsan_read" + ByteSizeStr);
-    TsanRead[i] = M.getOrInsertFunction(ReadName, Attr, IRB.getVoidTy(),
-                                        IRB.getPtrTy());
+    TsanRead[i] =
+        M.getOrInsertFunction(ReadName, Attr, IRB.getVoidTy(), IRB.getPtrTy());
 
     SmallString<32> WriteName("__tsan_write" + ByteSizeStr);
-    TsanWrite[i] = M.getOrInsertFunction(WriteName, Attr, IRB.getVoidTy(),
-                                         IRB.getPtrTy());
+    TsanWrite[i] =
+        M.getOrInsertFunction(WriteName, Attr, IRB.getVoidTy(), IRB.getPtrTy());
 
     SmallString<64> UnalignedReadName("__tsan_unaligned_read" + ByteSizeStr);
     TsanUnalignedRead[i] = M.getOrInsertFunction(
@@ -258,8 +287,8 @@ void ThreadSanitizer::initialize(Module &M, const TargetLibraryInfo &TLI) {
         UnalignedVolatileWriteName, Attr, IRB.getVoidTy(), IRB.getPtrTy());
 
     SmallString<64> CompoundRWName("__tsan_read_write" + ByteSizeStr);
-    TsanCompoundRW[i] = M.getOrInsertFunction(
-        CompoundRWName, Attr, IRB.getVoidTy(), IRB.getPtrTy());
+    TsanCompoundRW[i] = M.getOrInsertFunction(CompoundRWName, Attr,
+                                              IRB.getVoidTy(), IRB.getPtrTy());
 
     SmallString<64> UnalignedCompoundRWName("__tsan_unaligned_read_write" +
                                             ByteSizeStr);
@@ -277,7 +306,7 @@ void ThreadSanitizer::initialize(Module &M, const TargetLibraryInfo &TLI) {
 
     // Args of type Ty need extension only when BitSize is 32 or less.
     using Idxs = std::vector<unsigned>;
-    Idxs Idxs2Or12   ((BitSize <= 32) ? Idxs({1, 2})       : Idxs({2}));
+    Idxs Idxs2Or12((BitSize <= 32) ? Idxs({1, 2}) : Idxs({2}));
     Idxs Idxs34Or1234((BitSize <= 32) ? Idxs({1, 2, 3, 4}) : Idxs({3, 4}));
     SmallString<32> AtomicStoreName("__tsan_atomic" + BitSizeStr + "_store");
     TsanAtomicStore[i] = M.getOrInsertFunction(
@@ -336,12 +365,10 @@ void ThreadSanitizer::initialize(Module &M, const TargetLibraryInfo &TLI) {
       TLI.getAttrList(&Ctx, {0}, /*Signed=*/true, /*Ret=*/false, Attr),
       IRB.getVoidTy(), OrdTy);
 
-  MemmoveFn =
-      M.getOrInsertFunction("__tsan_memmove", Attr, IRB.getPtrTy(),
-                            IRB.getPtrTy(), IRB.getPtrTy(), IntptrTy);
-  MemcpyFn =
-      M.getOrInsertFunction("__tsan_memcpy", Attr, IRB.getPtrTy(),
-                            IRB.getPtrTy(), IRB.getPtrTy(), IntptrTy);
+  MemmoveFn = M.getOrInsertFunction("__tsan_memmove", Attr, IRB.getPtrTy(),
+                                    IRB.getPtrTy(), IRB.getPtrTy(), IntptrTy);
+  MemcpyFn = M.getOrInsertFunction("__tsan_memcpy", Attr, IRB.getPtrTy(),
+                                   IRB.getPtrTy(), IRB.getPtrTy(), IntptrTy);
   MemsetFn = M.getOrInsertFunction(
       "__tsan_memset",
       TLI.getAttrList(&Ctx, {1}, /*Signed=*/true, /*Ret=*/false, Attr),
@@ -514,9 +541,9 @@ bool ThreadSanitizer::sanitizeFunction(Function &F,
 
   initialize(*F.getParent(), TLI);
   SmallVector<InstructionInfo, 8> AllLoadsAndStores;
-  SmallVector<Instruction*, 8> LocalLoadsAndStores;
-  SmallVector<Instruction*, 8> AtomicAccesses;
-  SmallVector<Instruction*, 8> MemIntrinCalls;
+  SmallVector<Instruction *, 8> LocalLoadsAndStores;
+  SmallVector<Instruction *, 8> AtomicAccesses;
+  SmallVector<Instruction *, 8> MemIntrinCalls;
   bool Res = false;
   bool HasCalls = false;
   bool SanitizeFunction = F.hasFnAttribute(Attribute::SanitizeThread);
@@ -593,6 +620,80 @@ bool ThreadSanitizer::sanitizeFunction(Function &F,
   return Res;
 }
 
+void createWrappedTsanCall(Instruction *I, FunctionCallee TsanFuncToCall,
+                           Value *Addr, bool IsWrite) {
+  constexpr uint64_t CACHE_MASK = 0xFFF;
+  constexpr uint64_t ADDR_TAG_MASK = 0x03FFFFFFFFFF8000ULL;
+  constexpr uint64_t WRITE_BIT_MASK = 0x8000000000000000ULL;
+  constexpr uint64_t IGNORE_WRITE_BIT_MASK = 0x7FFFFFFFFFFFFFFFULL;
+
+  BasicBlock *CheckBB = I->getParent();
+  Function *ParentF = CheckBB->getParent();
+  LLVMContext &Ctx = ParentF->getContext();
+  Type *Int64Ty = Type::getInt64Ty(Ctx);
+  Type *Int32Ty = Type::getInt32Ty(Ctx);
+
+  // Split 1: Create the landing zone after the instrumentation
+  BasicBlock *MergeBB = CheckBB->splitBasicBlock(I, "tsan_merge");
+
+  // Split 2: Create the slow-path fallback block
+  BasicBlock *MissBB = BasicBlock::Create(Ctx, "tsan_miss", ParentF, MergeBB);
+
+  // Delete the default unconditional branch instruction
+  CheckBB->getTerminator()->eraseFromParent();
+
+  // --- EMIT CHECK BB LOGIC ---
+  IRBuilder<> CheckBuilder(CheckBB);
+  Value *RawAddr = Addr;
+  if (RawAddr->getType()->isPointerTy()) {
+    RawAddr = CheckBuilder.CreatePtrToInt(RawAddr, Int64Ty);
+  } else if (RawAddr->getType()->getIntegerBitWidth() < 64) {
+    RawAddr = CheckBuilder.CreateZExt(RawAddr, Int64Ty);
+  }
+
+  Value *ShiftedAddr =
+      CheckBuilder.CreateLShr(RawAddr, ConstantInt::get(Int64Ty, 3));
+  Value *Index = CheckBuilder.CreateAnd(ShiftedAddr,
+                                        ConstantInt::get(Int64Ty, CACHE_MASK));
+  Value *Index32 = CheckBuilder.CreateTrunc(Index, Int32Ty);
+
+  Value *Gep = CheckBuilder.CreateGEP(CacheArrayTy, L0FilterGlobal,
+                                      {CheckBuilder.getInt32(0), Index32});
+  Value *CachedEntry = CheckBuilder.CreateLoad(Int64Ty, Gep);
+  Value *LocalEpoch = CheckBuilder.CreateLoad(Int64Ty, LocalEpochGlobal);
+
+  Value *TaggedAddr =
+      CheckBuilder.CreateAnd(RawAddr, ConstantInt::get(Int64Ty, ADDR_TAG_MASK));
+  Value *Expected = CheckBuilder.CreateOr(TaggedAddr, LocalEpoch);
+  if (IsWrite) {
+    Expected = CheckBuilder.CreateOr(Expected,
+                                     ConstantInt::get(Int64Ty, WRITE_BIT_MASK));
+  }
+
+  Value *IsHit = nullptr;
+  if (!IsWrite) {
+    Value *XorRes = CheckBuilder.CreateXor(CachedEntry, Expected);
+    Value *MaskedRes = CheckBuilder.CreateAnd(
+        XorRes, ConstantInt::get(Int64Ty, IGNORE_WRITE_BIT_MASK));
+    IsHit = CheckBuilder.CreateICmpEQ(MaskedRes, ConstantInt::get(Int64Ty, 0));
+  } else {
+    Value *XorRes = CheckBuilder.CreateXor(CachedEntry, Expected);
+    IsHit = CheckBuilder.CreateICmpEQ(XorRes, ConstantInt::get(Int64Ty, 0));
+  }
+  CheckBuilder.CreateCondBr(IsHit, MergeBB, MissBB);
+
+  // --- EMIT MISS BB LOGIC ---
+  IRBuilder<> MissBuilder(MissBB);
+
+  // Call the function pointer that TSan generated natively
+  MissBuilder.CreateCall(TsanFuncToCall, Addr);
+
+  Value *GepMiss = MissBuilder.CreateGEP(CacheArrayTy, L0FilterGlobal,
+                                         {MissBuilder.getInt32(0), Index32});
+  MissBuilder.CreateStore(Expected, GepMiss);
+  MissBuilder.CreateBr(MergeBB);
+}
+
 bool ThreadSanitizer::instrumentLoadOrStore(const InstructionInfo &II,
                                             const DataLayout &DL) {
   InstrumentationIRBuilder IRB(II.Inst);
@@ -659,7 +760,14 @@ bool ThreadSanitizer::instrumentLoadOrStore(const InstructionInfo &II,
     else
       OnAccessFunc = IsWrite ? TsanUnalignedWrite[Idx] : TsanUnalignedRead[Idx];
   }
-  IRB.CreateCall(OnAccessFunc, Addr);
+
+  // ========================= MODIFICATION ===========================
+  if (ClEnableL0Filter) {
+    createWrappedTsanCall(II.Inst, OnAccessFunc, Addr, IsWrite);
+  } else {
+    IRB.CreateCall(OnAccessFunc, Addr);
+  }
+
   if (IsCompoundRW || IsWrite)
     NumInstrumentedWrites++;
   if (IsCompoundRW || !IsWrite)
@@ -670,16 +778,27 @@ bool ThreadSanitizer::instrumentLoadOrStore(const InstructionInfo &II,
 static ConstantInt *createOrdering(IRBuilder<> *IRB, AtomicOrdering ord) {
   uint32_t v = 0;
   switch (ord) {
-    case AtomicOrdering::NotAtomic:
-      llvm_unreachable("unexpected atomic ordering!");
-    case AtomicOrdering::Unordered:              [[fallthrough]];
-    case AtomicOrdering::Monotonic:              v = 0; break;
+  case AtomicOrdering::NotAtomic:
+    llvm_unreachable("unexpected atomic ordering!");
+  case AtomicOrdering::Unordered:
+    [[fallthrough]];
+  case AtomicOrdering::Monotonic:
+    v = 0;
+    break;
     // Not specified yet:
     // case AtomicOrdering::Consume:                v = 1; break;
-    case AtomicOrdering::Acquire:                v = 2; break;
-    case AtomicOrdering::Release:                v = 3; break;
-    case AtomicOrdering::AcquireRelease:         v = 4; break;
-    case AtomicOrdering::SequentiallyConsistent: v = 5; break;
+  case AtomicOrdering::Acquire:
+    v = 2;
+    break;
+  case AtomicOrdering::Release:
+    v = 3;
+    break;
+  case AtomicOrdering::AcquireRelease:
+    v = 4;
+    break;
+  case AtomicOrdering::SequentiallyConsistent:
+    v = 5;
+    break;
   }
   return IRB->getInt32(v);
 }
@@ -695,20 +814,15 @@ static ConstantInt *createOrdering(IRBuilder<> *IRB, AtomicOrdering ord) {
 bool ThreadSanitizer::instrumentMemIntrinsic(Instruction *I) {
   InstrumentationIRBuilder IRB(I);
   if (MemSetInst *M = dyn_cast<MemSetInst>(I)) {
-    Value *Cast1 = IRB.CreateIntCast(M->getArgOperand(1), IRB.getInt32Ty(), false);
+    Value *Cast1 =
+        IRB.CreateIntCast(M->getArgOperand(1), IRB.getInt32Ty(), false);
     Value *Cast2 = IRB.CreateIntCast(M->getArgOperand(2), IntptrTy, false);
-    IRB.CreateCall(
-        MemsetFn,
-        {M->getArgOperand(0),
-         Cast1,
-         Cast2});
+    IRB.CreateCall(MemsetFn, {M->getArgOperand(0), Cast1, Cast2});
     I->eraseFromParent();
   } else if (MemTransferInst *M = dyn_cast<MemTransferInst>(I)) {
-    IRB.CreateCall(
-        isa<MemCpyInst>(M) ? MemcpyFn : MemmoveFn,
-        {M->getArgOperand(0),
-         M->getArgOperand(1),
-         IRB.CreateIntCast(M->getArgOperand(2), IntptrTy, false)});
+    IRB.CreateCall(isa<MemCpyInst>(M) ? MemcpyFn : MemmoveFn,
+                   {M->getArgOperand(0), M->getArgOperand(1),
+                    IRB.CreateIntCast(M->getArgOperand(2), IntptrTy, false)});
     I->eraseFromParent();
   }
   return false;
@@ -730,8 +844,7 @@ bool ThreadSanitizer::instrumentAtomic(Instruction *I, const DataLayout &DL) {
     int Idx = getMemoryAccessFuncIndex(OrigTy, Addr, DL);
     if (Idx < 0)
       return false;
-    Value *Args[] = {Addr,
-                     createOrdering(&IRB, LI->getOrdering())};
+    Value *Args[] = {Addr, createOrdering(&IRB, LI->getOrdering())};
     Value *C = IRB.CreateCall(TsanAtomicLoad[Idx], Args);
     Value *Cast = IRB.CreateBitOrPointerCast(C, OrigTy);
     I->replaceAllUsesWith(Cast);
@@ -778,12 +891,10 @@ bool ThreadSanitizer::instrumentAtomic(Instruction *I, const DataLayout &DL) {
     const unsigned BitSize = ByteSize * 8;
     Type *Ty = Type::getIntNTy(IRB.getContext(), BitSize);
     Value *CmpOperand =
-      IRB.CreateBitOrPointerCast(CASI->getCompareOperand(), Ty);
+        IRB.CreateBitOrPointerCast(CASI->getCompareOperand(), Ty);
     Value *NewOperand =
-      IRB.CreateBitOrPointerCast(CASI->getNewValOperand(), Ty);
-    Value *Args[] = {Addr,
-                     CmpOperand,
-                     NewOperand,
+        IRB.CreateBitOrPointerCast(CASI->getNewValOperand(), Ty);
+    Value *Args[] = {Addr, CmpOperand, NewOperand,
                      createOrdering(&IRB, CASI->getSuccessOrdering()),
                      createOrdering(&IRB, CASI->getFailureOrdering())};
     CallInst *C = IRB.CreateCall(TsanAtomicCAS[Idx], Args);
@@ -795,7 +906,7 @@ bool ThreadSanitizer::instrumentAtomic(Instruction *I, const DataLayout &DL) {
     }
 
     Value *Res =
-      IRB.CreateInsertValue(PoisonValue::get(CASI->getType()), OldVal, 0);
+        IRB.CreateInsertValue(PoisonValue::get(CASI->getType()), OldVal, 0);
     Res = IRB.CreateInsertValue(Res, Success, 1);
 
     I->replaceAllUsesWith(Res);
@@ -819,8 +930,8 @@ int ThreadSanitizer::getMemoryAccessFuncIndex(Type *OrigTy, Value *Addr,
     return -1;
   }
   uint32_t TypeSize = DL.getTypeStoreSizeInBits(OrigTy);
-  if (TypeSize != 8  && TypeSize != 16 &&
-      TypeSize != 32 && TypeSize != 64 && TypeSize != 128) {
+  if (TypeSize != 8 && TypeSize != 16 && TypeSize != 32 && TypeSize != 64 &&
+      TypeSize != 128) {
     NumAccessesWithBadSize++;
     // Ignore all unusual sizes.
     return -1;
