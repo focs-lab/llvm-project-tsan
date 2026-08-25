@@ -104,11 +104,6 @@ const char kTsanModuleCtorName[] = "tsan.module_ctor";
 const char kTsanInitName[] = "__tsan_init";
 
 namespace {
-
-static llvm::GlobalVariable *L0FilterGlobal = nullptr;
-static llvm::GlobalVariable *LocalEpochGlobal = nullptr;
-static llvm::ArrayType *CacheArrayTy = nullptr;
-
 /// ThreadSanitizer: instrument the code in module to find races.
 ///
 /// Instantiating ThreadSanitizer inserts the tsan runtime library API function
@@ -127,6 +122,10 @@ struct ThreadSanitizer {
 
   bool sanitizeFunction(Function &F, const TargetLibraryInfo &TLI);
 
+  llvm::GlobalVariable *L0FilterGlobal = nullptr;
+  llvm::GlobalVariable *LocalEpochGlobal = nullptr;
+  llvm::ArrayType *CacheArrayTy = nullptr;
+
 private:
   // Internal Instruction wrapper that contains more information about the
   // Instruction from prior analysis.
@@ -143,6 +142,8 @@ private:
 
   void initialize(Module &M, const TargetLibraryInfo &TLI);
   bool instrumentLoadOrStore(const InstructionInfo &II, const DataLayout &DL);
+  void createWrappedTsanCall(Instruction *I, FunctionCallee TsanFuncToCall,
+                             Value *Addr, bool IsWrite);
   bool instrumentAtomic(Instruction *I, const DataLayout &DL);
   bool instrumentMemIntrinsic(Instruction *I);
   void chooseInstructionsToInstrument(SmallVectorImpl<Instruction *> &Local,
@@ -151,6 +152,8 @@ private:
   bool addrPointsToConstantData(Value *Addr);
   int getMemoryAccessFuncIndex(Type *OrigTy, Value *Addr, const DataLayout &DL);
   void InsertRuntimeIgnores(Function &F);
+  void emitEpochAdvance(IRBuilder<> &IRB, Instruction *InsertBefore);
+  bool isSyncOrdering(AtomicOrdering Ord);
 
   Type *IntptrTy;
   FunctionCallee TsanFuncEntry;
@@ -201,38 +204,35 @@ PreservedAnalyses ThreadSanitizerPass::run(Function &F,
 
 PreservedAnalyses ModuleThreadSanitizerPass::run(Module &M,
                                                  ModuleAnalysisManager &MAM) {
-
-  LLVMContext &Ctx = M.getContext();
-  Type *Int64Ty = Type::getInt64Ty(Ctx);
-
-  CacheArrayTy = ArrayType::get(Int64Ty, 4096);
-
-  L0FilterGlobal = M.getGlobalVariable("TSanL0Filter");
-  if (!L0FilterGlobal) {
-    L0FilterGlobal = new GlobalVariable(
-        M, CacheArrayTy, false, GlobalValue::InternalLinkage,
-        ConstantAggregateZero::get(CacheArrayTy), "TSanL0Filter", nullptr,
-        GlobalValue::ThreadLocalMode::GeneralDynamicTLSModel);
-  }
-
-  LocalEpochGlobal = M.getGlobalVariable("TSanLocalEpoch");
-  if (!LocalEpochGlobal) {
-    LocalEpochGlobal = new GlobalVariable(
-        M, Int64Ty, false, GlobalValue::InternalLinkage,
-        ConstantInt::get(Int64Ty, 1), "TSanLocalEpoch", nullptr,
-        GlobalValue::ThreadLocalMode::GeneralDynamicTLSModel);
-  }
-
   // Return early if nosanitize_thread module flag is present for the module.
   if (checkIfAlreadyInstrumented(M, "nosanitize_thread"))
     return PreservedAnalyses::all();
   insertModuleCtor(M);
   return PreservedAnalyses::none();
 }
+
 void ThreadSanitizer::initialize(Module &M, const TargetLibraryInfo &TLI) {
   const DataLayout &DL = M.getDataLayout();
   LLVMContext &Ctx = M.getContext();
   IntptrTy = DL.getIntPtrType(Ctx);
+
+  Type *Int64Ty = Type::getInt64Ty(Ctx);
+  CacheArrayTy = ArrayType::get(Int64Ty, 4096);
+  L0FilterGlobal = M.getGlobalVariable("TSanL0Filter");
+  if (!L0FilterGlobal) {
+    L0FilterGlobal = new GlobalVariable(
+        M, CacheArrayTy, false, GlobalValue::WeakODRLinkage,
+        ConstantAggregateZero::get(CacheArrayTy), "TSanL0Filter", nullptr,
+        GlobalValue::ThreadLocalMode::InitialExecTLSModel);
+  }
+
+  LocalEpochGlobal = M.getGlobalVariable("TSanLocalEpoch");
+  if (!LocalEpochGlobal) {
+    LocalEpochGlobal = new GlobalVariable(
+        M, Int64Ty, false, GlobalValue::WeakODRLinkage,
+        ConstantInt::get(Int64Ty, 1), "TSanLocalEpoch", nullptr,
+        GlobalValue::ThreadLocalMode::InitialExecTLSModel);
+  }
 
   IRBuilder<> IRB(Ctx);
   AttributeList Attr;
@@ -620,8 +620,9 @@ bool ThreadSanitizer::sanitizeFunction(Function &F,
   return Res;
 }
 
-void createWrappedTsanCall(Instruction *I, FunctionCallee TsanFuncToCall,
-                           Value *Addr, bool IsWrite) {
+void ThreadSanitizer::createWrappedTsanCall(Instruction *I,
+                                            FunctionCallee TsanFuncToCall,
+                                            Value *Addr, bool IsWrite) {
   constexpr uint64_t CACHE_MASK = 0xFFF;
   constexpr uint64_t ADDR_TAG_MASK = 0x03FFFFFFFFFF8000ULL;
   constexpr uint64_t WRITE_BIT_MASK = 0x8000000000000000ULL;
@@ -644,6 +645,7 @@ void createWrappedTsanCall(Instruction *I, FunctionCallee TsanFuncToCall,
 
   // --- EMIT CHECK BB LOGIC ---
   IRBuilder<> CheckBuilder(CheckBB);
+  CheckBuilder.SetCurrentDebugLocation(I->getDebugLoc());
   Value *RawAddr = Addr;
   if (RawAddr->getType()->isPointerTy()) {
     RawAddr = CheckBuilder.CreatePtrToInt(RawAddr, Int64Ty);
@@ -684,6 +686,7 @@ void createWrappedTsanCall(Instruction *I, FunctionCallee TsanFuncToCall,
 
   // --- EMIT MISS BB LOGIC ---
   IRBuilder<> MissBuilder(MissBB);
+  MissBuilder.SetCurrentDebugLocation(I->getDebugLoc());
 
   // Call the function pointer that TSan generated natively
   MissBuilder.CreateCall(TsanFuncToCall, Addr);
@@ -845,6 +848,10 @@ bool ThreadSanitizer::instrumentAtomic(Instruction *I, const DataLayout &DL) {
     if (Idx < 0)
       return false;
     Value *Args[] = {Addr, createOrdering(&IRB, LI->getOrdering())};
+    if (isSyncOrdering(LI->getOrdering())) {
+      emitEpochAdvance(IRB, I);
+    }
+
     Value *C = IRB.CreateCall(TsanAtomicLoad[Idx], Args);
     Value *Cast = IRB.CreateBitOrPointerCast(C, OrigTy);
     I->replaceAllUsesWith(Cast);
@@ -861,6 +868,10 @@ bool ThreadSanitizer::instrumentAtomic(Instruction *I, const DataLayout &DL) {
     Value *Args[] = {Addr,
                      IRB.CreateBitOrPointerCast(SI->getValueOperand(), Ty),
                      createOrdering(&IRB, SI->getOrdering())};
+    if (isSyncOrdering(SI->getOrdering())) {
+      emitEpochAdvance(IRB, I);
+    }
+
     IRB.CreateCall(TsanAtomicStore[Idx], Args);
     SI->eraseFromParent();
   } else if (AtomicRMWInst *RMWI = dyn_cast<AtomicRMWInst>(I)) {
@@ -878,6 +889,10 @@ bool ThreadSanitizer::instrumentAtomic(Instruction *I, const DataLayout &DL) {
     Value *Val = RMWI->getValOperand();
     Value *Args[] = {Addr, IRB.CreateBitOrPointerCast(Val, Ty),
                      createOrdering(&IRB, RMWI->getOrdering())};
+    if (isSyncOrdering(RMWI->getOrdering())) {
+      emitEpochAdvance(IRB, I);
+    }
+
     Value *C = IRB.CreateCall(F, Args);
     I->replaceAllUsesWith(IRB.CreateBitOrPointerCast(C, Val->getType()));
     I->eraseFromParent();
@@ -897,6 +912,11 @@ bool ThreadSanitizer::instrumentAtomic(Instruction *I, const DataLayout &DL) {
     Value *Args[] = {Addr, CmpOperand, NewOperand,
                      createOrdering(&IRB, CASI->getSuccessOrdering()),
                      createOrdering(&IRB, CASI->getFailureOrdering())};
+    if (isSyncOrdering(CASI->getSuccessOrdering()) ||
+        isSyncOrdering(CASI->getFailureOrdering())) {
+      emitEpochAdvance(IRB, I);
+    }
+
     CallInst *C = IRB.CreateCall(TsanAtomicCAS[Idx], Args);
     Value *Success = IRB.CreateICmpEQ(C, CmpOperand);
     Value *OldVal = C;
@@ -916,6 +936,10 @@ bool ThreadSanitizer::instrumentAtomic(Instruction *I, const DataLayout &DL) {
     FunctionCallee F = FI->getSyncScopeID() == SyncScope::SingleThread
                            ? TsanAtomicSignalFence
                            : TsanAtomicThreadFence;
+    if (FI->getSyncScopeID() != SyncScope::SingleThread) {
+      emitEpochAdvance(IRB, I);
+    }
+
     IRB.CreateCall(F, Args);
     FI->eraseFromParent();
   }
@@ -939,4 +963,56 @@ int ThreadSanitizer::getMemoryAccessFuncIndex(Type *OrigTy, Value *Addr,
   size_t Idx = llvm::countr_zero(TypeSize / 8);
   assert(Idx < kNumberOfAccessSizes);
   return Idx;
+}
+
+// Emits: load epoch, increment, and on the rare 15-bit rollover, flush the
+// whole cache and reset to 0. Call this immediately before/after any
+// instrumented atomic op or fence.
+void ThreadSanitizer::emitEpochAdvance(IRBuilder<> &IRB,
+                                       Instruction *InsertBefore) {
+  LLVMContext &Ctx = InsertBefore->getContext();
+  Type *Int64Ty = Type::getInt64Ty(Ctx);
+  Function *ParentF = InsertBefore->getParent()->getParent();
+
+  BasicBlock *CurBB = InsertBefore->getParent();
+  BasicBlock *MergeBB = CurBB->splitBasicBlock(InsertBefore, "epoch_merge");
+  BasicBlock *RolloverBB =
+      BasicBlock::Create(Ctx, "epoch_rollover", ParentF, MergeBB);
+  BasicBlock *NormalBB =
+      BasicBlock::Create(Ctx, "epoch_normal", ParentF, MergeBB);
+
+  CurBB->getTerminator()->eraseFromParent();
+
+  IRBuilder<> HeadB(CurBB);
+  Value *CurEpoch = HeadB.CreateLoad(Int64Ty, LocalEpochGlobal, "epoch.cur");
+  Value *NewEpoch =
+      HeadB.CreateAdd(CurEpoch, ConstantInt::get(Int64Ty, 1), "epoch.next");
+  Value *NeedsRollover = HeadB.CreateICmpUGT(
+      NewEpoch, ConstantInt::get(Int64Ty, 0x7FFF), "epoch.rollover");
+  HeadB.CreateCondBr(NeedsRollover, RolloverBB, NormalBB);
+
+  // Rare path: zero the whole cache array and reset epoch to 1.
+  IRBuilder<> RB(RolloverBB);
+  RB.CreateMemSet(L0FilterGlobal, RB.getInt8(0), RB.getInt64(4096 * 8),
+                  MaybeAlign(8));
+  RB.CreateStore(ConstantInt::get(Int64Ty, 1), LocalEpochGlobal);
+  RB.CreateBr(MergeBB);
+
+  // Common path: just store the incremented epoch.
+  IRBuilder<> NB(NormalBB);
+  NB.CreateStore(NewEpoch, LocalEpochGlobal);
+  NB.CreateBr(MergeBB);
+  IRB.SetInsertPoint(InsertBefore);
+}
+
+bool ThreadSanitizer::isSyncOrdering(AtomicOrdering Ord) {
+  switch (Ord) {
+  case AtomicOrdering::Acquire:
+  case AtomicOrdering::Release:
+  case AtomicOrdering::AcquireRelease:
+  case AtomicOrdering::SequentiallyConsistent:
+    return true;
+  default:
+    return false;
+  }
 }
