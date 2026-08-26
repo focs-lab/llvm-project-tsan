@@ -71,6 +71,36 @@ void InitializeShadowMemory() {
   DPrintf("meta shadow: %zx-%zx (%zuGB)\n",
       meta, meta + meta_size, meta_size >> 30);
 
+  if (flags()->one_word_filter) {
+#    if __BYTE_ORDER__ != __ORDER_LITTLE_ENDIAN__
+    Printf("FATAL: ThreadSanitizer one-word filter requires little endian\n");
+    Die();
+#    endif
+    uptr limit = ~uptr{};
+    if (HiAppMemBeg() > OneWordBeg())
+      limit = Min(limit, HiAppMemBeg());
+    if (MidAppMemBeg() > OneWordBeg())
+      limit = Min(limit, MidAppMemBeg());
+    if (HeapMemBeg() > OneWordBeg())
+      limit = Min(limit, HeapMemBeg());
+    if (OneWordEnd() > limit ||
+        !MmapFixedSuperNoReserve(OneWordBeg(), OneWordEnd() - OneWordBeg(),
+                                 "one-word shadow")) {
+      Printf("FATAL: ThreadSanitizer can not mmap one-word shadow memory\n");
+      Die();
+    }
+    DontDumpShadow(OneWordBeg(), OneWordEnd() - OneWordBeg());
+    one_word_filter_enabled = true;
+    __tsan_one_word_lo_beg = LoAppMemBeg();
+    __tsan_one_word_lo_end = LoAppMemEnd();
+    __tsan_one_word_heap_beg = HeapMemBeg();
+    __tsan_one_word_heap_end = HeapMemEnd();
+    __tsan_one_word_shadow_beg = OneWordBeg();
+    __tsan_one_word_enabled = 1;
+    DPrintf("one-word shadow: %zx-%zx (%zuGB)\n", OneWordBeg(), OneWordEnd(),
+            (OneWordEnd() - OneWordBeg()) >> 30);
+  }
+
   InitializeShadowMemoryPlatform();
 
   on_initialize = reinterpret_cast<void (*)(void)>(

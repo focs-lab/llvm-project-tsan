@@ -35,6 +35,8 @@ TSAN_FLAG(bool, report_signal_unsafe, true,
           "(e.g. malloc() call from a signal handler).")
 TSAN_FLAG(bool, report_atomic_races, true,
           "Report races between atomic and plain memory accesses.")
+TSAN_FLAG(bool, one_word_filter, false,
+          "Keep one-word heap histories outside the regular shadow.")
 TSAN_FLAG(
     bool, force_seq_cst_atomics, false,
     "If set, all atomics are effectively sequentially consistent (seq_cst), "

@@ -84,6 +84,10 @@ static cl::opt<bool>
     ClOmitNonCaptured("tsan-omit-by-pointer-capturing", cl::init(true),
                       cl::desc("Omit accesses due to pointer capturing"),
                       cl::Hidden);
+static cl::opt<bool>
+    ClOneWordFilter("tsan-one-word-filter", cl::init(false),
+                    cl::desc("Inline the TSan one-word heap filter"),
+                    cl::Hidden);
 
 STATISTIC(NumInstrumentedReads, "Number of instrumented reads");
 STATISTIC(NumInstrumentedWrites, "Number of instrumented writes");
@@ -136,6 +140,9 @@ private:
 
   void initialize(Module &M, const TargetLibraryInfo &TLI);
   bool instrumentLoadOrStore(const InstructionInfo &II, const DataLayout &DL);
+  void instrumentOneWordAccess(Instruction *InsertBefore, Value *Addr,
+                               unsigned ByteSize, bool IsWrite,
+                               FunctionCallee OnAccessFunc);
   bool instrumentAtomic(Instruction *I, const DataLayout &DL);
   bool instrumentMemIntrinsic(Instruction *I);
   void chooseInstructionsToInstrument(SmallVectorImpl<Instruction *> &Local,
@@ -172,6 +179,21 @@ private:
   FunctionCallee TsanVptrUpdate;
   FunctionCallee TsanVptrLoad;
   FunctionCallee MemmoveFn, MemcpyFn, MemsetFn;
+  FunctionCallee TsanOneWordFastState;
+  GlobalVariable *OneWordEnabled = nullptr;
+  GlobalVariable *OneWordLoBeg = nullptr;
+  GlobalVariable *OneWordLoEnd = nullptr;
+  GlobalVariable *OneWordHeapBeg = nullptr;
+  GlobalVariable *OneWordHeapEnd = nullptr;
+  GlobalVariable *OneWordShadowBeg = nullptr;
+  Value *OneWordFastStatePtr = nullptr;
+  Value *OneWordEnabledValue = nullptr;
+  Value *OneWordLoBegValue = nullptr;
+  Value *OneWordLoEndValue = nullptr;
+  Value *OneWordHeapBegValue = nullptr;
+  Value *OneWordHeapEndValue = nullptr;
+  Value *OneWordShadowBegValue = nullptr;
+  bool OneWordFunctionHasCalls = false;
 };
 
 void insertModuleCtor(Module &M) {
@@ -208,6 +230,22 @@ void ThreadSanitizer::initialize(Module &M, const TargetLibraryInfo &TLI) {
   IRBuilder<> IRB(Ctx);
   AttributeList Attr;
   Attr = Attr.addFnAttribute(Ctx, Attribute::NoUnwind);
+  if (ClOneWordFilter) {
+    OneWordEnabled = cast<GlobalVariable>(
+        M.getOrInsertGlobal("__tsan_one_word_enabled", IRB.getInt32Ty()));
+    OneWordLoBeg = cast<GlobalVariable>(
+        M.getOrInsertGlobal("__tsan_one_word_lo_beg", IntptrTy));
+    OneWordLoEnd = cast<GlobalVariable>(
+        M.getOrInsertGlobal("__tsan_one_word_lo_end", IntptrTy));
+    OneWordHeapBeg = cast<GlobalVariable>(
+        M.getOrInsertGlobal("__tsan_one_word_heap_beg", IntptrTy));
+    OneWordHeapEnd = cast<GlobalVariable>(
+        M.getOrInsertGlobal("__tsan_one_word_heap_end", IntptrTy));
+    OneWordShadowBeg = cast<GlobalVariable>(
+        M.getOrInsertGlobal("__tsan_one_word_shadow_beg", IntptrTy));
+    TsanOneWordFastState = M.getOrInsertFunction("__tsan_one_word_fast_state",
+                                                 Attr, IRB.getPtrTy());
+  }
   // Initialize the callbacks.
   TsanFuncEntry = M.getOrInsertFunction("__tsan_func_entry", Attr,
                                         IRB.getVoidTy(), IRB.getPtrTy());
@@ -519,6 +557,7 @@ bool ThreadSanitizer::sanitizeFunction(Function &F,
   SmallVector<Instruction*, 8> MemIntrinCalls;
   bool Res = false;
   bool HasCalls = false;
+  bool HasNonIntrinsicCalls = false;
   bool SanitizeFunction = F.hasFnAttribute(Attribute::SanitizeThread);
   const DataLayout &DL = F.getDataLayout();
 
@@ -538,6 +577,7 @@ bool ThreadSanitizer::sanitizeFunction(Function &F,
         if (isa<MemIntrinsic>(Inst))
           MemIntrinCalls.push_back(&Inst);
         HasCalls = true;
+        HasNonIntrinsicCalls |= !isa<IntrinsicInst>(Inst);
         chooseInstructionsToInstrument(LocalLoadsAndStores, AllLoadsAndStores,
                                        DL);
       }
@@ -548,6 +588,15 @@ bool ThreadSanitizer::sanitizeFunction(Function &F,
   // We have collected all loads and stores.
   // FIXME: many of these accesses do not need to be checked for races
   // (e.g. variables that do not escape, etc).
+
+  OneWordFastStatePtr = nullptr;
+  OneWordEnabledValue = nullptr;
+  OneWordLoBegValue = nullptr;
+  OneWordLoEndValue = nullptr;
+  OneWordHeapBegValue = nullptr;
+  OneWordHeapEndValue = nullptr;
+  OneWordShadowBegValue = nullptr;
+  OneWordFunctionHasCalls = HasNonIntrinsicCalls;
 
   // Instrument memory accesses only if we want to report bugs in the function.
   if (ClInstrumentMemoryAccesses && SanitizeFunction)
@@ -643,7 +692,9 @@ bool ThreadSanitizer::instrumentLoadOrStore(const InstructionInfo &II,
 
   const uint32_t TypeSize = DL.getTypeStoreSizeInBits(OrigTy);
   FunctionCallee OnAccessFunc = nullptr;
-  if (Alignment >= Align(8) || (Alignment.value() % (TypeSize / 8)) == 0) {
+  const bool IsAligned =
+      Alignment >= Align(8) || (Alignment.value() % (TypeSize / 8)) == 0;
+  if (IsAligned) {
     if (IsCompoundRW)
       OnAccessFunc = TsanCompoundRW[Idx];
     else if (IsVolatile)
@@ -659,12 +710,89 @@ bool ThreadSanitizer::instrumentLoadOrStore(const InstructionInfo &II,
     else
       OnAccessFunc = IsWrite ? TsanUnalignedWrite[Idx] : TsanUnalignedRead[Idx];
   }
-  IRB.CreateCall(OnAccessFunc, Addr);
+  const bool UseOneWord = ClOneWordFilter && DL.isLittleEndian() &&
+                          !OneWordFunctionHasCalls && IsAligned && Idx < 4 &&
+                          !IsCompoundRW && !IsVolatile;
+  if (UseOneWord && !OneWordFastStatePtr) {
+    Function *F = II.Inst->getFunction();
+    InstrumentationIRBuilder EntryIRB(&F->getEntryBlock(),
+                                      F->getEntryBlock().getFirstNonPHIIt());
+    OneWordFastStatePtr = EntryIRB.CreateCall(TsanOneWordFastState);
+    OneWordEnabledValue =
+        EntryIRB.CreateLoad(EntryIRB.getInt32Ty(), OneWordEnabled);
+    OneWordLoBegValue = EntryIRB.CreateLoad(IntptrTy, OneWordLoBeg);
+    OneWordLoEndValue = EntryIRB.CreateLoad(IntptrTy, OneWordLoEnd);
+    OneWordHeapBegValue = EntryIRB.CreateLoad(IntptrTy, OneWordHeapBeg);
+    OneWordHeapEndValue = EntryIRB.CreateLoad(IntptrTy, OneWordHeapEnd);
+    OneWordShadowBegValue = EntryIRB.CreateLoad(IntptrTy, OneWordShadowBeg);
+  }
+  if (UseOneWord)
+    instrumentOneWordAccess(II.Inst, Addr, 1U << Idx, IsWrite, OnAccessFunc);
+  else
+    IRB.CreateCall(OnAccessFunc, Addr);
   if (IsCompoundRW || IsWrite)
     NumInstrumentedWrites++;
   if (IsCompoundRW || !IsWrite)
     NumInstrumentedReads++;
   return true;
+}
+
+void ThreadSanitizer::instrumentOneWordAccess(Instruction *InsertBefore,
+                                              Value *Addr, unsigned ByteSize,
+                                              bool IsWrite,
+                                              FunctionCallee OnAccessFunc) {
+  InstrumentationIRBuilder IRB(InsertBefore);
+  LLVMContext &Ctx = InsertBefore->getContext();
+
+  Value *AddrInt = IRB.CreatePtrToInt(Addr, IntptrTy);
+  Value *Enabled = IRB.CreateICmpNE(OneWordEnabledValue,
+                                    ConstantInt::get(IRB.getInt32Ty(), 0));
+  Value *InLo = IRB.CreateAnd(IRB.CreateICmpUGE(AddrInt, OneWordLoBegValue),
+                              IRB.CreateICmpULT(AddrInt, OneWordLoEndValue));
+  Value *InHeap =
+      IRB.CreateAnd(IRB.CreateICmpUGE(AddrInt, OneWordHeapBegValue),
+                    IRB.CreateICmpULT(AddrInt, OneWordHeapEndValue));
+  Value *FastState = IRB.CreateLoad(IRB.getInt32Ty(), OneWordFastStatePtr);
+  Value *CanProbe = IRB.CreateAnd(Enabled, IRB.CreateOr(InLo, InHeap));
+
+  BasicBlock *Entry = InsertBefore->getParent();
+  BasicBlock *Continue = Entry->splitBasicBlock(InsertBefore, "tsan.cont");
+  Entry->getTerminator()->eraseFromParent();
+  Function *F = Entry->getParent();
+  BasicBlock *Probe = BasicBlock::Create(Ctx, "tsan.one_word", F, Continue);
+  BasicBlock *Runtime = BasicBlock::Create(Ctx, "tsan.runtime", F, Continue);
+  IRB.SetInsertPoint(Entry);
+  IRB.CreateCondBr(CanProbe, Probe, Runtime);
+
+  IRB.SetInsertPoint(Probe);
+  Value *LoCell = IRB.CreateLShr(IRB.CreateSub(AddrInt, OneWordLoBegValue), 3);
+  Value *LoCells =
+      IRB.CreateLShr(IRB.CreateSub(OneWordLoEndValue, OneWordLoBegValue), 3);
+  Value *HeapCell = IRB.CreateAdd(
+      LoCells, IRB.CreateLShr(IRB.CreateSub(AddrInt, OneWordHeapBegValue), 3));
+  Value *Cell = IRB.CreateSelect(InLo, LoCell, HeapCell);
+  Value *NoteAddr =
+      IRB.CreateAdd(OneWordShadowBegValue, IRB.CreateShl(Cell, 2));
+  Value *NotePtr = IRB.CreateIntToPtr(NoteAddr, IRB.getPtrTy());
+  LoadInst *Note = IRB.CreateLoad(IRB.getInt32Ty(), NotePtr);
+  Note->setAtomic(AtomicOrdering::Monotonic);
+  Note->setAlignment(Align(4));
+
+  Value *Shift = IRB.CreateTrunc(IRB.CreateAnd(AddrInt, 7), IRB.getInt32Ty());
+  Value *Access = IRB.CreateShl(IRB.getInt32((1U << ByteSize) - 1), Shift);
+  Value *Cur = IRB.CreateOr(FastState, Access);
+  if (!IsWrite)
+    Cur = IRB.CreateOr(Cur, IRB.getInt32(0x40000000));
+  Value *Same = IRB.CreateICmpEQ(Note, Cur);
+  if (!IsWrite)
+    Same = IRB.CreateOr(
+        Same,
+        IRB.CreateICmpEQ(IRB.CreateOr(Note, IRB.getInt32(0x40000000)), Cur));
+  IRB.CreateCondBr(Same, Continue, Runtime);
+
+  IRB.SetInsertPoint(Runtime);
+  IRB.CreateCall(OnAccessFunc, Addr);
+  IRB.CreateBr(Continue);
 }
 
 static ConstantInt *createOrdering(IRBuilder<> *IRB, AtomicOrdering ord) {

@@ -391,6 +391,18 @@ struct Context {
 };
 
 extern Context *ctx;  // The one and the only global runtime context.
+extern bool one_word_filter_enabled;
+
+#if !SANITIZER_GO
+extern "C" {
+extern SANITIZER_INTERFACE_ATTRIBUTE uptr __tsan_one_word_lo_beg;
+extern SANITIZER_INTERFACE_ATTRIBUTE uptr __tsan_one_word_lo_end;
+extern SANITIZER_INTERFACE_ATTRIBUTE uptr __tsan_one_word_heap_beg;
+extern SANITIZER_INTERFACE_ATTRIBUTE uptr __tsan_one_word_heap_end;
+extern SANITIZER_INTERFACE_ATTRIBUTE uptr __tsan_one_word_shadow_beg;
+extern SANITIZER_INTERFACE_ATTRIBUTE u32 __tsan_one_word_enabled;
+}
+#endif
 
 ALWAYS_INLINE Flags *flags() {
   return &ctx->flags;

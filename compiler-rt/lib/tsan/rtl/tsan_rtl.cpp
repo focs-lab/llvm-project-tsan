@@ -61,6 +61,17 @@ alignas(SANITIZER_CACHE_LINE_SIZE) THREADLOCAL __attribute__((tls_model(
 #endif
 alignas(SANITIZER_CACHE_LINE_SIZE) static char ctx_placeholder[sizeof(Context)];
 Context *ctx;
+bool one_word_filter_enabled;
+#if !SANITIZER_GO
+extern "C" {
+SANITIZER_INTERFACE_ATTRIBUTE uptr __tsan_one_word_lo_beg;
+SANITIZER_INTERFACE_ATTRIBUTE uptr __tsan_one_word_lo_end;
+SANITIZER_INTERFACE_ATTRIBUTE uptr __tsan_one_word_heap_beg;
+SANITIZER_INTERFACE_ATTRIBUTE uptr __tsan_one_word_heap_end;
+SANITIZER_INTERFACE_ATTRIBUTE uptr __tsan_one_word_shadow_beg;
+SANITIZER_INTERFACE_ATTRIBUTE u32 __tsan_one_word_enabled;
+}
+#endif
 
 // Can be overriden by a front-end.
 #ifdef TSAN_EXTERNAL_HOOKS
@@ -230,6 +241,14 @@ static void DoResetImpl(uptr epoch) {
     Printf("failed to reset shadow memory\n");
     Die();
   }
+#if !SANITIZER_GO && SANITIZER_POSIX
+  if (one_word_filter_enabled) {
+    if (!MmapFixedSuperNoReserve(OneWordBeg(), OneWordEnd() - OneWordBeg(),
+                                 "one-word shadow"))
+      Die();
+    DontDumpShadow(OneWordBeg(), OneWordEnd() - OneWordBeg());
+  }
+#endif
   DPrintf("Resetting meta shadow...\n");
   ctx->metamap.ResetClocks();
   StoreShadow(&ctx->last_spurious_race, Shadow::kEmpty);

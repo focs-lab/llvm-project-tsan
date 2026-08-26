@@ -1055,6 +1055,39 @@ u32* MemToMeta(uptr x) {
   return SelectMapping<MemToMetaImpl>(STRIP_MTE_TAG(x));
 }
 
+ALWAYS_INLINE uptr OneWordBeg() { return MetaShadowEnd(); }
+
+ALWAYS_INLINE uptr OneWordEnd() {
+  uptr app_size = LoAppMemEnd() - LoAppMemBeg();
+  app_size += HeapMemEnd() - HeapMemBeg();
+  return OneWordBeg() + app_size / kShadowCell * sizeof(u32);
+}
+
+ALWAYS_INLINE bool IsOneWordMem(uptr x) {
+  x = STRIP_MTE_TAG(x);
+  return (x >= LoAppMemBeg() && x < LoAppMemEnd()) ||
+         (x >= HeapMemBeg() && x < HeapMemEnd());
+}
+
+ALWAYS_INLINE uptr OneWordMemEnd(uptr x) {
+  DCHECK(IsOneWordMem(x));
+  x = STRIP_MTE_TAG(x);
+  return x < LoAppMemEnd() ? LoAppMemEnd() : HeapMemEnd();
+}
+
+ALWAYS_INLINE atomic_uint32_t *MemToOneWord(uptr x) {
+  DCHECK(IsOneWordMem(x));
+  x = STRIP_MTE_TAG(x);
+  uptr index;
+  if (x < LoAppMemEnd()) {
+    index = (x - LoAppMemBeg()) / kShadowCell;
+  } else {
+    index = (LoAppMemEnd() - LoAppMemBeg()) / kShadowCell;
+    index += (x - HeapMemBeg()) / kShadowCell;
+  }
+  return reinterpret_cast<atomic_uint32_t *>(OneWordBeg()) + index;
+}
+
 struct ShadowToMemImpl {
   template <typename Mapping>
   static uptr Apply(uptr sp) {

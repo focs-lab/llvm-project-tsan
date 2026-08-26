@@ -417,6 +417,109 @@ NOINLINE void TraceRestartMemoryAccess(ThreadState* thr, uptr pc, uptr addr,
   MemoryAccess(thr, pc, addr, size, typ);
 }
 
+namespace one_word {
+
+constexpr u32 kShared = 0;
+constexpr u32 kAccessMask = 0x000000ff;
+constexpr u32 kSidMask = 0x0000ff00;
+constexpr u32 kEpochMask = 0x3fff0000;
+constexpr u32 kTypeMask = 0xc0000000;
+
+ALWAYS_INLINE bool Enabled(uptr addr) {
+  return one_word_filter_enabled && IsOneWordMem(addr);
+}
+
+ALWAYS_INLINE u32 Load(uptr addr) {
+  return atomic_load(MemToOneWord(addr), memory_order_acquire);
+}
+
+ALWAYS_INLINE bool CompareExchange(uptr addr, u32* old, u32 value) {
+  return atomic_compare_exchange_weak(MemToOneWord(addr), old, value,
+                                      memory_order_acq_rel);
+}
+
+ALWAYS_INLINE bool TryExactMerge(u32 a, u32 b, u32* merged) {
+  if ((a ^ b) & kSidMask)
+    return false;
+
+  const bool a_dominates_b = (((b & kAccessMask) & ~(a & kAccessMask)) == 0) &&
+                             ((a & kEpochMask) >= (b & kEpochMask)) &&
+                             (((a & kTypeMask) & ~(b & kTypeMask)) == 0);
+  const bool b_dominates_a = (((a & kAccessMask) & ~(b & kAccessMask)) == 0) &&
+                             ((b & kEpochMask) >= (a & kEpochMask)) &&
+                             (((b & kTypeMask) & ~(a & kTypeMask)) == 0);
+  const bool same_epoch_and_type = ((a ^ b) & (kEpochMask | kTypeMask)) == 0;
+  if (!a_dominates_b && !b_dominates_a && !same_epoch_and_type)
+    return false;
+
+  *merged = (a & kSidMask) | ((a | b) & kAccessMask) |
+            Max(a & kEpochMask, b & kEpochMask) | ((a & b) & kTypeMask);
+  return true;
+}
+
+void HandOver(uptr addr, RawShadow* shadow_mem) {
+  for (;;) {
+    u32 old = Load(addr);
+    if (old == kShared)
+      return;
+    StoreShadow(&shadow_mem[0], static_cast<RawShadow>(old));
+    if (CompareExchange(addr, &old, kShared))
+      return;
+  }
+}
+
+void HandOverRange(uptr addr, uptr size) {
+  if (!one_word_filter_enabled || size == 0)
+    return;
+  addr = STRIP_MTE_TAG(addr);
+  if (!IsOneWordMem(addr))
+    return;
+  uptr beg = addr;
+  uptr end = Min(addr + size, OneWordMemEnd(addr));
+  beg = RoundDown(beg, kShadowCell);
+  end = RoundUp(end, kShadowCell);
+  for (uptr p = beg; p < end; p += kShadowCell) HandOver(p, MemToShadow(p));
+}
+
+void SetRange(uptr addr, uptr size, u32 value) {
+  if (!one_word_filter_enabled || size == 0)
+    return;
+  addr = STRIP_MTE_TAG(addr);
+  if (!IsOneWordMem(addr))
+    return;
+  uptr beg = addr;
+  uptr end = Min(addr + size, OneWordMemEnd(addr));
+  beg = RoundDown(beg, kShadowCell);
+  end = RoundUp(end, kShadowCell);
+  auto* first = MemToOneWord(beg);
+  auto* last = MemToOneWord(end - kShadowCell) + 1;
+  uptr bytes = reinterpret_cast<uptr>(last) - reinterpret_cast<uptr>(first);
+
+  if (bytes <= common_flags()->clear_shadow_mmap_threshold) {
+    for (; first != last; ++first)
+      atomic_store(first, value, memory_order_release);
+    return;
+  }
+
+  const uptr page = GetPageSizeCached();
+  auto* middle_beg = reinterpret_cast<atomic_uint32_t*>(
+      RoundUp(reinterpret_cast<uptr>(first) + page / 2, page));
+  auto* middle_end = reinterpret_cast<atomic_uint32_t*>(
+      RoundDown(reinterpret_cast<uptr>(last), page));
+  for (; first < Min(last, middle_beg); ++first)
+    atomic_store(first, value, memory_order_release);
+  if (middle_beg < middle_end &&
+      !MmapFixedSuperNoReserve(reinterpret_cast<uptr>(middle_beg),
+                               reinterpret_cast<uptr>(middle_end) -
+                                   reinterpret_cast<uptr>(middle_beg),
+                               "one-word shadow"))
+    Die();
+  for (auto* p = Max(first, middle_end); p < last; ++p)
+    atomic_store(p, value, memory_order_release);
+}
+
+}  // namespace one_word
+
 ALWAYS_INLINE USED void MemoryAccess(ThreadState* thr, uptr pc, uptr addr,
                                      uptr size, AccessType typ) {
 #if SANITIZER_APPLE && !SANITIZER_GO
@@ -436,13 +539,40 @@ ALWAYS_INLINE USED void MemoryAccess(ThreadState* thr, uptr pc, uptr addr,
 
   FastState fast_state = thr->fast_state;
   Shadow cur(fast_state, addr, size, typ);
+  bool traced = false;
+
+  if (UNLIKELY(one_word::Enabled(addr))) {
+    if (UNLIKELY(fast_state.GetIgnoreBit()))
+      return;
+    for (;;) {
+      u32 old = one_word::Load(addr);
+      if (old == one_word::kShared)
+        break;
+      if (typ & ~kAccessRead) {
+        one_word::HandOver(addr, shadow_mem);
+        break;
+      }
+      u32 merged;
+      if (!one_word::TryExactMerge(old, static_cast<u32>(cur.raw()), &merged)) {
+        one_word::HandOver(addr, shadow_mem);
+        break;
+      }
+      if (merged == old)
+        return;
+      if (!traced && !TryTraceMemoryAccess(thr, pc, addr, size, typ))
+        return TraceRestartMemoryAccess(thr, pc, addr, size, typ);
+      traced = true;
+      if (one_word::CompareExchange(addr, &old, merged))
+        return;
+    }
+  }
 
   LOAD_CURRENT_SHADOW(cur, shadow_mem);
   if (LIKELY(ContainsSameAccess(shadow_mem, cur, shadow, access, typ)))
     return;
   if (UNLIKELY(fast_state.GetIgnoreBit()))
     return;
-  if (!TryTraceMemoryAccess(thr, pc, addr, size, typ))
+  if (!traced && !TryTraceMemoryAccess(thr, pc, addr, size, typ))
     return TraceRestartMemoryAccess(thr, pc, addr, size, typ);
   CheckRaces(thr, shadow_mem, cur, shadow, access, typ);
 }
@@ -462,6 +592,7 @@ ALWAYS_INLINE USED void MemoryAccess16(ThreadState* thr, uptr pc, uptr addr,
   FastState fast_state = thr->fast_state;
   if (UNLIKELY(fast_state.GetIgnoreBit()))
     return;
+  one_word::HandOverRange(addr, size);
   Shadow cur(fast_state, 0, 8, typ);
   RawShadow* shadow_mem = MemToShadow(addr);
   bool traced = false;
@@ -499,6 +630,7 @@ ALWAYS_INLINE USED void UnalignedMemoryAccess(ThreadState* thr, uptr pc,
   FastState fast_state = thr->fast_state;
   if (UNLIKELY(fast_state.GetIgnoreBit()))
     return;
+  one_word::HandOverRange(addr, size);
   RawShadow* shadow_mem = MemToShadow(addr);
   bool traced = false;
   uptr size1 = Min<uptr>(size, RoundUp(addr + 1, kShadowCell) - addr);
@@ -593,6 +725,7 @@ void MemoryResetRange(ThreadState* thr, uptr pc, uptr addr, uptr size) {
   uptr addr1 = RoundDown(addr, kShadowCell);
   uptr size1 = RoundUp(size + addr - addr1, kShadowCell);
   MemoryRangeSet(addr1, size1, Shadow::kEmpty);
+  one_word::SetRange(addr1, size1, 0);
 }
 
 void MemoryRangeFreed(ThreadState* thr, uptr pc, uptr addr, uptr size) {
@@ -610,7 +743,10 @@ void MemoryRangeFreed(ThreadState* thr, uptr pc, uptr addr, uptr size) {
   // Processing more than 1k (2k of shadow) is expensive,
   // can cause excessive memory consumption (user does not necessary touch
   // the whole range) and most likely unnecessary.
-  size = Min<uptr>(size, 1024);
+  uptr checked_size = Min<uptr>(size, 1024);
+  one_word::HandOverRange(addr, checked_size);
+  one_word::SetRange(addr + checked_size, size - checked_size, 0);
+  size = checked_size;
   const AccessType typ = kAccessWrite | kAccessFree | kAccessSlotLocked |
                          kAccessCheckOnly | kAccessNoRodata;
   TraceMemoryAccessRange(thr, pc, addr, size, typ);
@@ -644,6 +780,12 @@ void MemoryRangeImitateWrite(ThreadState* thr, uptr pc, uptr addr, uptr size) {
   size = RoundUp(size, kShadowCell);
   TraceMemoryAccessRange(thr, pc, addr, size, kAccessWrite);
   Shadow cur(thr->fast_state, 0, 8, kAccessWrite);
+  if (one_word_filter_enabled && IsOneWordMem(addr) &&
+      addr + size <= OneWordMemEnd(addr)) {
+    MemoryRangeSet(addr, size, Shadow::kEmpty);
+    one_word::SetRange(addr, size, static_cast<u32>(cur.raw()));
+    return;
+  }
   MemoryRangeSet(addr, size, cur.raw());
 }
 
@@ -721,6 +863,8 @@ void MemoryAccessRangeT(ThreadState* thr, uptr pc, uptr addr, uptr size) {
   FastState fast_state = thr->fast_state;
   if (UNLIKELY(fast_state.GetIgnoreBit()))
     return;
+
+  one_word::HandOverRange(addr, size);
 
   if (!TryTraceMemoryAccessRange(thr, pc, addr, size, typ))
     return RestartMemoryAccessRange<is_read>(thr, pc, addr, size);

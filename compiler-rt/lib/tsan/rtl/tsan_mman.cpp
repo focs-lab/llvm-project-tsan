@@ -282,7 +282,10 @@ void OnUserAlloc(ThreadState *thr, uptr pc, uptr p, uptr sz, bool write) {
   // and we don't have trace initialized, we can't imitate writes.
   // In such case just reset the shadow range, it is fine since
   // it affects only a small fraction of special objects.
-  if (write && thr->ignore_reads_and_writes == 0 &&
+  const bool one_word_alloc = one_word_filter_enabled && SANITIZER_APPLE &&
+                              flags()->ignore_interceptors_accesses &&
+                              thr->ignore_reads_and_writes == 1;
+  if (write && (thr->ignore_reads_and_writes == 0 || one_word_alloc) &&
       atomic_load_relaxed(&thr->trace_pos))
     MemoryRangeImitateWrite(thr, pc, (uptr)p, sz);
   else
