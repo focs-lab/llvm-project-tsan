@@ -219,6 +219,7 @@ PreservedAnalyses ModuleThreadSanitizerPass::run(Module &M,
 }
 void ThreadSanitizer::initialize(Module &M, const TargetLibraryInfo &TLI) {
   const DataLayout &DL = M.getDataLayout();
+  const Triple TargetTriple(M.getTargetTriple());
   LLVMContext &Ctx = M.getContext();
   IntptrTy = DL.getIntPtrType(Ctx);
 
@@ -226,7 +227,8 @@ void ThreadSanitizer::initialize(Module &M, const TargetLibraryInfo &TLI) {
   AttributeList Attr;
   Attr = Attr.addFnAttribute(Ctx, Attribute::NoUnwind);
   ShadowResidentSupported =
-      ClShadowResidentFilter && Triple(M.getTargetTriple()).isOSLinux() &&
+      ClShadowResidentFilter &&
+      (TargetTriple.isOSLinux() || TargetTriple.isOSDarwin()) &&
       DL.isLittleEndian() && DL.getPointerSizeInBits() == 64;
   if (ShadowResidentSupported) {
     ShadowAddressMask = cast<GlobalVariable>(
@@ -736,6 +738,8 @@ void ThreadSanitizer::instrumentShadowResidentAccess(
   BasicBlock *Continue = Entry->splitBasicBlock(InsertBefore, "tsan.cont");
   Entry->getTerminator()->eraseFromParent();
   Function *F = Entry->getParent();
+  BasicBlock *Rest =
+      BasicBlock::Create(Ctx, "tsan.shadow.rest", F, Continue);
   BasicBlock *Runtime =
       BasicBlock::Create(Ctx, "tsan.shadow.runtime", F, Continue);
   IRB.SetInsertPoint(Entry);
@@ -750,15 +754,34 @@ void ThreadSanitizer::instrumentShadowResidentAccess(
   Value *Shift = IRB.CreateTrunc(IRB.CreateAnd(AddrInt, 7), IRB.getInt32Ty());
   Value *Access = IRB.CreateShl(IRB.getInt32((1U << ByteSize) - 1), Shift);
   Value *Cur = IRB.CreateOr(FastState, Access);
-  LoadInst *FirstLoad = IRB.CreateLoad(IRB.getInt32Ty(), ShadowPtr);
-  FirstLoad->setAtomic(AtomicOrdering::Monotonic);
-  FirstLoad->setAlignment(Align(4));
-  Value *First = FirstLoad;
-  if (!IsWrite) {
+  if (!IsWrite)
     Cur = IRB.CreateOr(Cur, IRB.getInt32(0x40000000));
-    First = IRB.CreateOr(First, IRB.getInt32(0x40000000));
-  }
-  Value *Same = IRB.CreateICmpEQ(First, Cur);
+
+  auto LoadSlot = [&](unsigned Index) {
+    Value *Slot =
+        IRB.CreateGEP(IRB.getInt32Ty(), ShadowPtr, IRB.getInt64(Index));
+    LoadInst *Load = IRB.CreateLoad(IRB.getInt32Ty(), Slot);
+    Load->setAtomic(AtomicOrdering::Monotonic);
+    Load->setAlignment(Align(4));
+    return Load;
+  };
+  auto IsSame = [&](Value *Old) {
+    Value *Comparable = Old;
+    if (!IsWrite)
+      Comparable = IRB.CreateOr(Comparable, IRB.getInt32(0x40000000));
+    Value *Same = IRB.CreateICmpEQ(Comparable, Cur);
+    if (!IsWrite)
+      Same = IRB.CreateOr(
+          Same, IRB.CreateICmpEQ(Old, IRB.getInt32(0x40000000)));
+    return Same;
+  };
+
+  IRB.CreateCondBr(IsSame(LoadSlot(0)), Continue, Rest);
+
+  IRB.SetInsertPoint(Rest);
+  Value *Same = IsSame(LoadSlot(1));
+  Same = IRB.CreateOr(Same, IsSame(LoadSlot(2)));
+  Same = IRB.CreateOr(Same, IsSame(LoadSlot(3)));
   IRB.CreateCondBr(Same, Continue, Runtime);
 
   IRB.SetInsertPoint(Runtime);

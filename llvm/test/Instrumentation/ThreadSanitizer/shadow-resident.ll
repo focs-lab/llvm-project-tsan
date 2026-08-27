@@ -1,5 +1,8 @@
 ; RUN: opt < %s -passes='function(tsan),module(tsan-module)' \
 ; RUN:   -tsan-shadow-resident-filter -S | FileCheck %s
+; RUN: opt < %s -mtriple=arm64-apple-macosx \
+; RUN:   -passes='function(tsan),module(tsan-module)' \
+; RUN:   -tsan-shadow-resident-filter -S | FileCheck %s
 
 target datalayout = "e-p:64:64-i64:64-n32:64-S128"
 target triple = "aarch64-unknown-linux-gnu"
@@ -12,6 +15,9 @@ define void @write8(ptr %p, i64 %value) sanitize_thread {
 ; CHECK:         load i64, ptr @__tsan_shadow_xor
 ; CHECK:         load i64, ptr @__tsan_shadow_add
 ; CHECK:         load atomic i32
+; CHECK:         br i1 {{.*}}, label %tsan.cont, label %tsan.shadow.rest
+; CHECK:       tsan.shadow.rest:
+; CHECK-COUNT-3: load atomic i32
 ; CHECK:         br i1 {{.*}}, label %tsan.cont, label %tsan.shadow.runtime
 ; CHECK:       tsan.shadow.runtime:
 ; CHECK-NEXT:    call void @__tsan_write8(ptr %p)
