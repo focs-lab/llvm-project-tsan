@@ -22,6 +22,11 @@ using namespace __tsan;
 
 void __tsan_init() { Initialize(cur_thread_init()); }
 
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE u32 *
+__tsan_shadow_resident_fast_state() {
+  return cur_thread()->fast_state.raw_ptr();
+}
+
 void __tsan_flush_memory() {
   FlushShadowMemory();
 }

@@ -41,6 +41,7 @@
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/TargetParser/Triple.h"
 #include "llvm/Transforms/Utils/EscapeEnumerator.h"
 #include "llvm/Transforms/Utils/Instrumentation.h"
 #include "llvm/Transforms/Utils/Local.h"
@@ -84,6 +85,9 @@ static cl::opt<bool>
     ClOmitNonCaptured("tsan-omit-by-pointer-capturing", cl::init(true),
                       cl::desc("Omit accesses due to pointer capturing"),
                       cl::Hidden);
+static cl::opt<bool> ClShadowResidentFilter(
+    "tsan-shadow-resident-filter", cl::init(false),
+    cl::desc("Inline exact TSan shadow hits"), cl::Hidden);
 
 STATISTIC(NumInstrumentedReads, "Number of instrumented reads");
 STATISTIC(NumInstrumentedWrites, "Number of instrumented writes");
@@ -136,6 +140,9 @@ private:
 
   void initialize(Module &M, const TargetLibraryInfo &TLI);
   bool instrumentLoadOrStore(const InstructionInfo &II, const DataLayout &DL);
+  void instrumentShadowResidentAccess(Instruction *InsertBefore, Value *Addr,
+                                      unsigned ByteSize, bool IsWrite,
+                                      FunctionCallee OnAccessFunc);
   bool instrumentAtomic(Instruction *I, const DataLayout &DL);
   bool instrumentMemIntrinsic(Instruction *I);
   void chooseInstructionsToInstrument(SmallVectorImpl<Instruction *> &Local,
@@ -172,6 +179,16 @@ private:
   FunctionCallee TsanVptrUpdate;
   FunctionCallee TsanVptrLoad;
   FunctionCallee MemmoveFn, MemcpyFn, MemsetFn;
+  FunctionCallee TsanShadowResidentFastState;
+  GlobalVariable *ShadowAddressMask = nullptr;
+  GlobalVariable *ShadowXor = nullptr;
+  GlobalVariable *ShadowAdd = nullptr;
+  Value *ShadowFastStatePtr = nullptr;
+  Value *ShadowAddressMaskValue = nullptr;
+  Value *ShadowXorValue = nullptr;
+  Value *ShadowAddValue = nullptr;
+  bool ShadowResidentSupported = false;
+  bool ShadowResidentFunctionHasCalls = false;
 };
 
 void insertModuleCtor(Module &M) {
@@ -208,6 +225,19 @@ void ThreadSanitizer::initialize(Module &M, const TargetLibraryInfo &TLI) {
   IRBuilder<> IRB(Ctx);
   AttributeList Attr;
   Attr = Attr.addFnAttribute(Ctx, Attribute::NoUnwind);
+  ShadowResidentSupported =
+      ClShadowResidentFilter && Triple(M.getTargetTriple()).isOSLinux() &&
+      DL.isLittleEndian() && DL.getPointerSizeInBits() == 64;
+  if (ShadowResidentSupported) {
+    ShadowAddressMask = cast<GlobalVariable>(
+        M.getOrInsertGlobal("__tsan_shadow_address_mask", IntptrTy));
+    ShadowXor = cast<GlobalVariable>(
+        M.getOrInsertGlobal("__tsan_shadow_xor", IntptrTy));
+    ShadowAdd = cast<GlobalVariable>(
+        M.getOrInsertGlobal("__tsan_shadow_add", IntptrTy));
+    TsanShadowResidentFastState = M.getOrInsertFunction(
+        "__tsan_shadow_resident_fast_state", Attr, IRB.getPtrTy());
+  }
   // Initialize the callbacks.
   TsanFuncEntry = M.getOrInsertFunction("__tsan_func_entry", Attr,
                                         IRB.getVoidTy(), IRB.getPtrTy());
@@ -519,6 +549,7 @@ bool ThreadSanitizer::sanitizeFunction(Function &F,
   SmallVector<Instruction*, 8> MemIntrinCalls;
   bool Res = false;
   bool HasCalls = false;
+  bool HasNonIntrinsicCalls = false;
   bool SanitizeFunction = F.hasFnAttribute(Attribute::SanitizeThread);
   const DataLayout &DL = F.getDataLayout();
 
@@ -538,6 +569,7 @@ bool ThreadSanitizer::sanitizeFunction(Function &F,
         if (isa<MemIntrinsic>(Inst))
           MemIntrinCalls.push_back(&Inst);
         HasCalls = true;
+        HasNonIntrinsicCalls |= !isa<IntrinsicInst>(Inst);
         chooseInstructionsToInstrument(LocalLoadsAndStores, AllLoadsAndStores,
                                        DL);
       }
@@ -548,6 +580,14 @@ bool ThreadSanitizer::sanitizeFunction(Function &F,
   // We have collected all loads and stores.
   // FIXME: many of these accesses do not need to be checked for races
   // (e.g. variables that do not escape, etc).
+
+  ShadowFastStatePtr = nullptr;
+  ShadowAddressMaskValue = nullptr;
+  ShadowXorValue = nullptr;
+  ShadowAddValue = nullptr;
+  ShadowResidentFunctionHasCalls = HasNonIntrinsicCalls ||
+                                   !AtomicAccesses.empty() ||
+                                   !MemIntrinCalls.empty();
 
   // Instrument memory accesses only if we want to report bugs in the function.
   if (ClInstrumentMemoryAccesses && SanitizeFunction)
@@ -643,7 +683,9 @@ bool ThreadSanitizer::instrumentLoadOrStore(const InstructionInfo &II,
 
   const uint32_t TypeSize = DL.getTypeStoreSizeInBits(OrigTy);
   FunctionCallee OnAccessFunc = nullptr;
-  if (Alignment >= Align(8) || (Alignment.value() % (TypeSize / 8)) == 0) {
+  const bool IsAligned =
+      Alignment >= Align(8) || (Alignment.value() % (TypeSize / 8)) == 0;
+  if (IsAligned) {
     if (IsCompoundRW)
       OnAccessFunc = TsanCompoundRW[Idx];
     else if (IsVolatile)
@@ -659,12 +701,69 @@ bool ThreadSanitizer::instrumentLoadOrStore(const InstructionInfo &II,
     else
       OnAccessFunc = IsWrite ? TsanUnalignedWrite[Idx] : TsanUnalignedRead[Idx];
   }
-  IRB.CreateCall(OnAccessFunc, Addr);
+  const bool UseShadowResident =
+      ShadowResidentSupported && !ShadowResidentFunctionHasCalls &&
+      IsAligned && Idx < 4 && !IsCompoundRW && !IsVolatile;
+  if (UseShadowResident && !ShadowFastStatePtr) {
+    Function *F = II.Inst->getFunction();
+    InstrumentationIRBuilder EntryIRB(&F->getEntryBlock(),
+                                      F->getEntryBlock().getFirstNonPHIIt());
+    ShadowFastStatePtr = EntryIRB.CreateCall(TsanShadowResidentFastState);
+    ShadowAddressMaskValue =
+        EntryIRB.CreateLoad(IntptrTy, ShadowAddressMask);
+    ShadowXorValue = EntryIRB.CreateLoad(IntptrTy, ShadowXor);
+    ShadowAddValue = EntryIRB.CreateLoad(IntptrTy, ShadowAdd);
+  }
+  if (UseShadowResident)
+    instrumentShadowResidentAccess(II.Inst, Addr, 1U << Idx, IsWrite,
+                                   OnAccessFunc);
+  else
+    IRB.CreateCall(OnAccessFunc, Addr);
   if (IsCompoundRW || IsWrite)
     NumInstrumentedWrites++;
   if (IsCompoundRW || !IsWrite)
     NumInstrumentedReads++;
   return true;
+}
+
+void ThreadSanitizer::instrumentShadowResidentAccess(
+    Instruction *InsertBefore, Value *Addr, unsigned ByteSize, bool IsWrite,
+    FunctionCallee OnAccessFunc) {
+  InstrumentationIRBuilder IRB(InsertBefore);
+  LLVMContext &Ctx = InsertBefore->getContext();
+
+  BasicBlock *Entry = InsertBefore->getParent();
+  BasicBlock *Continue = Entry->splitBasicBlock(InsertBefore, "tsan.cont");
+  Entry->getTerminator()->eraseFromParent();
+  Function *F = Entry->getParent();
+  BasicBlock *Runtime =
+      BasicBlock::Create(Ctx, "tsan.shadow.runtime", F, Continue);
+  IRB.SetInsertPoint(Entry);
+
+  Value *AddrInt = IRB.CreatePtrToInt(Addr, IntptrTy);
+  Value *ShadowAddr = IRB.CreateAnd(AddrInt, ShadowAddressMaskValue);
+  ShadowAddr = IRB.CreateXor(ShadowAddr, ShadowXorValue);
+  ShadowAddr = IRB.CreateAdd(IRB.CreateShl(ShadowAddr, 1), ShadowAddValue);
+  Value *ShadowPtr = IRB.CreateIntToPtr(ShadowAddr, IRB.getPtrTy());
+
+  Value *FastState = IRB.CreateLoad(IRB.getInt32Ty(), ShadowFastStatePtr);
+  Value *Shift = IRB.CreateTrunc(IRB.CreateAnd(AddrInt, 7), IRB.getInt32Ty());
+  Value *Access = IRB.CreateShl(IRB.getInt32((1U << ByteSize) - 1), Shift);
+  Value *Cur = IRB.CreateOr(FastState, Access);
+  LoadInst *FirstLoad = IRB.CreateLoad(IRB.getInt32Ty(), ShadowPtr);
+  FirstLoad->setAtomic(AtomicOrdering::Monotonic);
+  FirstLoad->setAlignment(Align(4));
+  Value *First = FirstLoad;
+  if (!IsWrite) {
+    Cur = IRB.CreateOr(Cur, IRB.getInt32(0x40000000));
+    First = IRB.CreateOr(First, IRB.getInt32(0x40000000));
+  }
+  Value *Same = IRB.CreateICmpEQ(First, Cur);
+  IRB.CreateCondBr(Same, Continue, Runtime);
+
+  IRB.SetInsertPoint(Runtime);
+  IRB.CreateCall(OnAccessFunc, Addr);
+  IRB.CreateBr(Continue);
 }
 
 static ConstantInt *createOrdering(IRBuilder<> *IRB, AtomicOrdering ord) {

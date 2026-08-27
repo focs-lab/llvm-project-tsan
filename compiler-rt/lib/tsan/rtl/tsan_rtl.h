@@ -392,6 +392,14 @@ struct Context {
 
 extern Context *ctx;  // The one and the only global runtime context.
 
+#if !SANITIZER_GO
+extern "C" {
+extern SANITIZER_INTERFACE_ATTRIBUTE uptr __tsan_shadow_address_mask;
+extern SANITIZER_INTERFACE_ATTRIBUTE uptr __tsan_shadow_xor;
+extern SANITIZER_INTERFACE_ATTRIBUTE uptr __tsan_shadow_add;
+}
+#endif
+
 ALWAYS_INLINE Flags *flags() {
   return &ctx->flags;
 }

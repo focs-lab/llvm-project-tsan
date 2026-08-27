@@ -58,6 +58,10 @@ void InitializeShadowMemory() {
   DPrintf("memory shadow: %zx-%zx (%zuGB)\n",
       ShadowBeg(), ShadowEnd(),
       (ShadowEnd() - ShadowBeg()) >> 30);
+  __tsan_shadow_address_mask =
+      STRIP_MTE_TAG(~uptr{}) & ~(ShadowMsk() | (kShadowCell - 1));
+  __tsan_shadow_xor = ShadowXor();
+  __tsan_shadow_add = ShadowAdd();
 
   // Map meta shadow.
   const uptr meta = MetaShadowBeg();

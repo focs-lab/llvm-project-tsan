@@ -61,6 +61,13 @@ alignas(SANITIZER_CACHE_LINE_SIZE) THREADLOCAL __attribute__((tls_model(
 #endif
 alignas(SANITIZER_CACHE_LINE_SIZE) static char ctx_placeholder[sizeof(Context)];
 Context *ctx;
+#if !SANITIZER_GO
+extern "C" {
+SANITIZER_INTERFACE_ATTRIBUTE uptr __tsan_shadow_address_mask;
+SANITIZER_INTERFACE_ATTRIBUTE uptr __tsan_shadow_xor;
+SANITIZER_INTERFACE_ATTRIBUTE uptr __tsan_shadow_add;
+}
+#endif
 
 // Can be overriden by a front-end.
 #ifdef TSAN_EXTERNAL_HOOKS

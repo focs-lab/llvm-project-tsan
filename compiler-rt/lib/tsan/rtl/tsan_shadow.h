@@ -36,6 +36,7 @@ class FastState {
   void SetIgnoreBit() { part_.ignore_accesses_ = 1; }
   void ClearIgnoreBit() { part_.ignore_accesses_ = 0; }
   bool GetIgnoreBit() const { return part_.ignore_accesses_; }
+  u32 *raw_ptr() { return &raw_; }
 
  private:
   friend class Shadow;

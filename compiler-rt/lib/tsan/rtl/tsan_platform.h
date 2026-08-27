@@ -911,6 +911,9 @@ enum MappingType {
   kHeapMemEnd,
   kShadowBeg,
   kShadowEnd,
+  kShadowMsk,
+  kShadowXor,
+  kShadowAdd,
   kMetaShadowBeg,
   kMetaShadowEnd,
   kVdsoBeg,
@@ -942,6 +945,12 @@ struct MappingField {
         return Mapping::kShadowBeg;
       case kShadowEnd:
         return Mapping::kShadowEnd;
+      case kShadowMsk:
+        return Mapping::kShadowMsk;
+      case kShadowXor:
+        return Mapping::kShadowXor;
+      case kShadowAdd:
+        return Mapping::kShadowAdd;
       case kMetaShadowBeg:
         return Mapping::kMetaShadowBeg;
       case kMetaShadowEnd:
@@ -978,6 +987,12 @@ ALWAYS_INLINE
 uptr ShadowBeg(void) { return SelectMapping<MappingField>(kShadowBeg); }
 ALWAYS_INLINE
 uptr ShadowEnd(void) { return SelectMapping<MappingField>(kShadowEnd); }
+ALWAYS_INLINE
+uptr ShadowMsk(void) { return SelectMapping<MappingField>(kShadowMsk); }
+ALWAYS_INLINE
+uptr ShadowXor(void) { return SelectMapping<MappingField>(kShadowXor); }
+ALWAYS_INLINE
+uptr ShadowAdd(void) { return SelectMapping<MappingField>(kShadowAdd); }
 
 ALWAYS_INLINE
 uptr MetaShadowBeg(void) { return SelectMapping<MappingField>(kMetaShadowBeg); }
