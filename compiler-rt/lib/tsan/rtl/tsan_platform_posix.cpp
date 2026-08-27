@@ -93,8 +93,8 @@ void InitializeShadowMemory() {
     one_word_filter_enabled = true;
     __tsan_one_word_lo_beg = LoAppMemBeg();
     __tsan_one_word_lo_end = LoAppMemEnd();
-    __tsan_one_word_heap_beg = HeapMemBeg();
-    __tsan_one_word_heap_end = HeapMemEnd();
+    __tsan_one_word_second_beg = OneWordSecondBeg();
+    __tsan_one_word_second_end = OneWordSecondEnd();
     __tsan_one_word_shadow_beg = OneWordBeg();
     __tsan_one_word_enabled = 1;
     DPrintf("one-word shadow: %zx-%zx (%zuGB)\n", OneWordBeg(), OneWordEnd(),

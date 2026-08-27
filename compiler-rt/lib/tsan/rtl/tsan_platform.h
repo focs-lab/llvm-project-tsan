@@ -1057,33 +1057,43 @@ u32* MemToMeta(uptr x) {
 
 ALWAYS_INLINE uptr OneWordBeg() { return MetaShadowEnd(); }
 
+ALWAYS_INLINE uptr OneWordSecondBeg() {
+  return HeapMemBeg() != HeapMemEnd() ? HeapMemBeg() : HiAppMemBeg();
+}
+
+ALWAYS_INLINE uptr OneWordSecondEnd() {
+  return HeapMemBeg() != HeapMemEnd() ? HeapMemEnd() : HiAppMemEnd();
+}
+
 ALWAYS_INLINE uptr OneWordEnd() {
   uptr app_size = LoAppMemEnd() - LoAppMemBeg();
-  app_size += HeapMemEnd() - HeapMemBeg();
+  app_size += OneWordSecondEnd() - OneWordSecondBeg();
   return OneWordBeg() + app_size / kShadowCell * sizeof(u32);
 }
 
 ALWAYS_INLINE bool IsOneWordMem(uptr x) {
   x = STRIP_MTE_TAG(x);
   return (x >= LoAppMemBeg() && x < LoAppMemEnd()) ||
-         (x >= HeapMemBeg() && x < HeapMemEnd());
+         (x >= OneWordSecondBeg() && x < OneWordSecondEnd());
 }
 
 ALWAYS_INLINE uptr OneWordMemEnd(uptr x) {
   DCHECK(IsOneWordMem(x));
   x = STRIP_MTE_TAG(x);
-  return x < LoAppMemEnd() ? LoAppMemEnd() : HeapMemEnd();
+  if (x >= LoAppMemBeg() && x < LoAppMemEnd())
+    return LoAppMemEnd();
+  return OneWordSecondEnd();
 }
 
 ALWAYS_INLINE atomic_uint32_t *MemToOneWord(uptr x) {
   DCHECK(IsOneWordMem(x));
   x = STRIP_MTE_TAG(x);
   uptr index;
-  if (x < LoAppMemEnd()) {
+  if (x >= LoAppMemBeg() && x < LoAppMemEnd()) {
     index = (x - LoAppMemBeg()) / kShadowCell;
   } else {
     index = (LoAppMemEnd() - LoAppMemBeg()) / kShadowCell;
-    index += (x - HeapMemBeg()) / kShadowCell;
+    index += (x - OneWordSecondBeg()) / kShadowCell;
   }
   return reinterpret_cast<atomic_uint32_t *>(OneWordBeg()) + index;
 }

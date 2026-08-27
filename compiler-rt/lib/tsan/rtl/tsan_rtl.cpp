@@ -66,8 +66,8 @@ bool one_word_filter_enabled;
 extern "C" {
 SANITIZER_INTERFACE_ATTRIBUTE uptr __tsan_one_word_lo_beg;
 SANITIZER_INTERFACE_ATTRIBUTE uptr __tsan_one_word_lo_end;
-SANITIZER_INTERFACE_ATTRIBUTE uptr __tsan_one_word_heap_beg;
-SANITIZER_INTERFACE_ATTRIBUTE uptr __tsan_one_word_heap_end;
+SANITIZER_INTERFACE_ATTRIBUTE uptr __tsan_one_word_second_beg;
+SANITIZER_INTERFACE_ATTRIBUTE uptr __tsan_one_word_second_end;
 SANITIZER_INTERFACE_ATTRIBUTE uptr __tsan_one_word_shadow_beg;
 SANITIZER_INTERFACE_ATTRIBUTE u32 __tsan_one_word_enabled;
 }

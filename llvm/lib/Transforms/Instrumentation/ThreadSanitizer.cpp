@@ -183,15 +183,15 @@ private:
   GlobalVariable *OneWordEnabled = nullptr;
   GlobalVariable *OneWordLoBeg = nullptr;
   GlobalVariable *OneWordLoEnd = nullptr;
-  GlobalVariable *OneWordHeapBeg = nullptr;
-  GlobalVariable *OneWordHeapEnd = nullptr;
+  GlobalVariable *OneWordSecondBeg = nullptr;
+  GlobalVariable *OneWordSecondEnd = nullptr;
   GlobalVariable *OneWordShadowBeg = nullptr;
   Value *OneWordFastStatePtr = nullptr;
   Value *OneWordEnabledValue = nullptr;
   Value *OneWordLoBegValue = nullptr;
   Value *OneWordLoEndValue = nullptr;
-  Value *OneWordHeapBegValue = nullptr;
-  Value *OneWordHeapEndValue = nullptr;
+  Value *OneWordSecondBegValue = nullptr;
+  Value *OneWordSecondEndValue = nullptr;
   Value *OneWordShadowBegValue = nullptr;
   bool OneWordFunctionHasCalls = false;
 };
@@ -237,10 +237,10 @@ void ThreadSanitizer::initialize(Module &M, const TargetLibraryInfo &TLI) {
         M.getOrInsertGlobal("__tsan_one_word_lo_beg", IntptrTy));
     OneWordLoEnd = cast<GlobalVariable>(
         M.getOrInsertGlobal("__tsan_one_word_lo_end", IntptrTy));
-    OneWordHeapBeg = cast<GlobalVariable>(
-        M.getOrInsertGlobal("__tsan_one_word_heap_beg", IntptrTy));
-    OneWordHeapEnd = cast<GlobalVariable>(
-        M.getOrInsertGlobal("__tsan_one_word_heap_end", IntptrTy));
+    OneWordSecondBeg = cast<GlobalVariable>(
+        M.getOrInsertGlobal("__tsan_one_word_second_beg", IntptrTy));
+    OneWordSecondEnd = cast<GlobalVariable>(
+        M.getOrInsertGlobal("__tsan_one_word_second_end", IntptrTy));
     OneWordShadowBeg = cast<GlobalVariable>(
         M.getOrInsertGlobal("__tsan_one_word_shadow_beg", IntptrTy));
     TsanOneWordFastState = M.getOrInsertFunction("__tsan_one_word_fast_state",
@@ -593,8 +593,8 @@ bool ThreadSanitizer::sanitizeFunction(Function &F,
   OneWordEnabledValue = nullptr;
   OneWordLoBegValue = nullptr;
   OneWordLoEndValue = nullptr;
-  OneWordHeapBegValue = nullptr;
-  OneWordHeapEndValue = nullptr;
+  OneWordSecondBegValue = nullptr;
+  OneWordSecondEndValue = nullptr;
   OneWordShadowBegValue = nullptr;
   OneWordFunctionHasCalls = HasNonIntrinsicCalls;
 
@@ -722,8 +722,8 @@ bool ThreadSanitizer::instrumentLoadOrStore(const InstructionInfo &II,
         EntryIRB.CreateLoad(EntryIRB.getInt32Ty(), OneWordEnabled);
     OneWordLoBegValue = EntryIRB.CreateLoad(IntptrTy, OneWordLoBeg);
     OneWordLoEndValue = EntryIRB.CreateLoad(IntptrTy, OneWordLoEnd);
-    OneWordHeapBegValue = EntryIRB.CreateLoad(IntptrTy, OneWordHeapBeg);
-    OneWordHeapEndValue = EntryIRB.CreateLoad(IntptrTy, OneWordHeapEnd);
+    OneWordSecondBegValue = EntryIRB.CreateLoad(IntptrTy, OneWordSecondBeg);
+    OneWordSecondEndValue = EntryIRB.CreateLoad(IntptrTy, OneWordSecondEnd);
     OneWordShadowBegValue = EntryIRB.CreateLoad(IntptrTy, OneWordShadowBeg);
   }
   if (UseOneWord)
@@ -749,11 +749,11 @@ void ThreadSanitizer::instrumentOneWordAccess(Instruction *InsertBefore,
                                     ConstantInt::get(IRB.getInt32Ty(), 0));
   Value *InLo = IRB.CreateAnd(IRB.CreateICmpUGE(AddrInt, OneWordLoBegValue),
                               IRB.CreateICmpULT(AddrInt, OneWordLoEndValue));
-  Value *InHeap =
-      IRB.CreateAnd(IRB.CreateICmpUGE(AddrInt, OneWordHeapBegValue),
-                    IRB.CreateICmpULT(AddrInt, OneWordHeapEndValue));
+  Value *InSecond =
+      IRB.CreateAnd(IRB.CreateICmpUGE(AddrInt, OneWordSecondBegValue),
+                    IRB.CreateICmpULT(AddrInt, OneWordSecondEndValue));
   Value *FastState = IRB.CreateLoad(IRB.getInt32Ty(), OneWordFastStatePtr);
-  Value *CanProbe = IRB.CreateAnd(Enabled, IRB.CreateOr(InLo, InHeap));
+  Value *CanProbe = IRB.CreateAnd(Enabled, IRB.CreateOr(InLo, InSecond));
 
   BasicBlock *Entry = InsertBefore->getParent();
   BasicBlock *Continue = Entry->splitBasicBlock(InsertBefore, "tsan.cont");
@@ -768,9 +768,10 @@ void ThreadSanitizer::instrumentOneWordAccess(Instruction *InsertBefore,
   Value *LoCell = IRB.CreateLShr(IRB.CreateSub(AddrInt, OneWordLoBegValue), 3);
   Value *LoCells =
       IRB.CreateLShr(IRB.CreateSub(OneWordLoEndValue, OneWordLoBegValue), 3);
-  Value *HeapCell = IRB.CreateAdd(
-      LoCells, IRB.CreateLShr(IRB.CreateSub(AddrInt, OneWordHeapBegValue), 3));
-  Value *Cell = IRB.CreateSelect(InLo, LoCell, HeapCell);
+  Value *SecondCell = IRB.CreateAdd(
+      LoCells,
+      IRB.CreateLShr(IRB.CreateSub(AddrInt, OneWordSecondBegValue), 3));
+  Value *Cell = IRB.CreateSelect(InLo, LoCell, SecondCell);
   Value *NoteAddr =
       IRB.CreateAdd(OneWordShadowBegValue, IRB.CreateShl(Cell, 2));
   Value *NotePtr = IRB.CreateIntToPtr(NoteAddr, IRB.getPtrTy());

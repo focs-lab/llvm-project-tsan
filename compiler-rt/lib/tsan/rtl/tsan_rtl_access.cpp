@@ -495,7 +495,8 @@ void SetRange(uptr addr, uptr size, u32 value) {
   auto* last = MemToOneWord(end - kShadowCell) + 1;
   uptr bytes = reinterpret_cast<uptr>(last) - reinterpret_cast<uptr>(first);
 
-  if (bytes <= common_flags()->clear_shadow_mmap_threshold) {
+  if (value != kShared ||
+      bytes <= common_flags()->clear_shadow_mmap_threshold) {
     for (; first != last; ++first)
       atomic_store(first, value, memory_order_release);
     return;

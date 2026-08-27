@@ -19,7 +19,7 @@ std::atomic<int> next_epoch;
 
 extern "C" uintptr_t __tsan_one_word_lo_beg;
 extern "C" uintptr_t __tsan_one_word_lo_end;
-extern "C" uintptr_t __tsan_one_word_heap_beg;
+extern "C" uintptr_t __tsan_one_word_second_beg;
 extern "C" uintptr_t __tsan_one_word_shadow_beg;
 
 __attribute__((disable_sanitizer_instrumentation)) uint32_t
@@ -30,7 +30,7 @@ load_note(Cell *cell) {
     index = (addr - __tsan_one_word_lo_beg) / 8;
   } else {
     index = (__tsan_one_word_lo_end - __tsan_one_word_lo_beg) / 8;
-    index += (addr - __tsan_one_word_heap_beg) / 8;
+    index += (addr - __tsan_one_word_second_beg) / 8;
   }
   auto *note = reinterpret_cast<uint32_t *>(__tsan_one_word_shadow_beg);
   return __atomic_load_n(note + index, __ATOMIC_ACQUIRE);
