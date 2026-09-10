@@ -3,6 +3,7 @@ __cxa_guard_abort
 __cxa_guard_release
 __tsan_init
 __tsan_flush_memory
+__tsan_ownership_profile_*
 __tsan_read*
 __tsan_write*
 __tsan_vptr*

@@ -41,6 +41,7 @@ set(TSAN_SOURCES
   tsan_report.cpp
   tsan_rtl.cpp
   tsan_rtl_access.cpp
+  tsan_ownership_profile.cpp
   tsan_rtl_mutex.cpp
   tsan_rtl_proc.cpp
   tsan_rtl_report.cpp
@@ -294,5 +295,4 @@ else()
                           clang_rt.tsan_cxx-${arch}-symbols)
   endforeach()
 endif()
-
 

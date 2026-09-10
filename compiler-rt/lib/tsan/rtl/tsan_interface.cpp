@@ -12,6 +12,7 @@
 
 #include "tsan_interface.h"
 #include "tsan_interface_ann.h"
+#include "tsan_ownership_profile.h"
 #include "tsan_rtl.h"
 #include "sanitizer_common/sanitizer_internal_defs.h"
 #include "sanitizer_common/sanitizer_ptrauth.h"
@@ -24,6 +25,11 @@ void __tsan_init() { Initialize(cur_thread_init()); }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE u32 *__tsan_one_word_fast_state() {
   return cur_thread()->fast_state.raw_ptr();
+}
+
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
+__tsan_ownership_profile_set_range(void *addr, uptr size) {
+  OwnershipProfileSetFocusRange(reinterpret_cast<uptr>(addr), size);
 }
 
 void __tsan_flush_memory() {

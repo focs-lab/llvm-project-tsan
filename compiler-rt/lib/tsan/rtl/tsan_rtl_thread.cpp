@@ -13,6 +13,7 @@
 #include "sanitizer_common/sanitizer_placement_new.h"
 #include "tsan_rtl.h"
 #include "tsan_mman.h"
+#include "tsan_ownership_profile.h"
 #include "tsan_platform.h"
 #include "tsan_report.h"
 #include "tsan_sync.h"
@@ -170,6 +171,7 @@ struct OnStartedArgs {
 void ThreadStart(ThreadState *thr, Tid tid, ThreadID os_id,
                  ThreadType thread_type) {
   ctx->thread_registry.StartThread(tid, os_id, thread_type, thr);
+  OwnershipProfileThreadStart(thr);
   if (!thr->ignore_sync) {
     SlotAttachAndLock(thr);
     if (thr->tctx->sync_epoch == ctx->global_epoch)

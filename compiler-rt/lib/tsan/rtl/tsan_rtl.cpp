@@ -25,6 +25,7 @@
 #include "tsan_defs.h"
 #include "tsan_interface.h"
 #include "tsan_mman.h"
+#include "tsan_ownership_profile.h"
 #include "tsan_platform.h"
 #include "tsan_suppressions.h"
 #include "tsan_symbolize.h"
@@ -818,6 +819,8 @@ void MaybeSpawnBackgroundThread() {
 
 int Finalize(ThreadState *thr) {
   bool failed = false;
+
+  PrintOwnershipProfile(thr);
 
 #if !SANITIZER_GO
   if (common_flags()->print_module_map == 1)

@@ -243,6 +243,11 @@ struct alignas(SANITIZER_CACHE_LINE_SIZE) ThreadState {
 
   AdaptiveDelayState adaptive_delay_state;
 
+  void *ownership_profile;
+  u32 ownership_profile_seen;
+  u32 ownership_profile_skip;
+  bool ownership_profile_retry;
+
   explicit ThreadState(Tid tid);
 };
 

@@ -20,6 +20,7 @@
 #include "sanitizer_common/sanitizer_stackdepot.h"
 #include "tsan_flags.h"
 #include "tsan_interface.h"
+#include "tsan_ownership_profile.h"
 #include "tsan_report.h"
 #include "tsan_rtl.h"
 
@@ -290,14 +291,18 @@ void OnUserAlloc(ThreadState *thr, uptr pc, uptr p, uptr sz, bool write) {
     MemoryRangeImitateWrite(thr, pc, (uptr)p, sz);
   else
     MemoryResetRange(thr, pc, (uptr)p, sz);
+  if (UNLIKELY(ownership_profile_enabled))
+    OwnershipProfileSetOwner(thr, p, sz);
 }
 
 void OnUserFree(ThreadState *thr, uptr pc, uptr p, bool write) {
   CHECK_NE(p, (void*)0);
   if (!thr->slot) {
     // Very early/late in thread lifetime, or during fork.
-    UNUSED uptr sz = ctx->metamap.FreeBlock(thr->proc(), p, false);
+    uptr sz = ctx->metamap.FreeBlock(thr->proc(), p, false);
     DPrintf("#%d: free(0x%zx, %zu) (no slot)\n", thr->tid, p, sz);
+    if (UNLIKELY(ownership_profile_enabled))
+      OwnershipProfileResetRange((uptr)p, sz);
     return;
   }
   SlotLocker locker(thr);
@@ -305,6 +310,8 @@ void OnUserFree(ThreadState *thr, uptr pc, uptr p, bool write) {
   DPrintf("#%d: free(0x%zx, %zu)\n", thr->tid, p, sz);
   if (write && thr->ignore_reads_and_writes == 0)
     MemoryRangeFreed(thr, pc, (uptr)p, sz);
+  if (UNLIKELY(ownership_profile_enabled))
+    OwnershipProfileResetRange((uptr)p, sz);
 }
 
 void *user_realloc(ThreadState *thr, uptr pc, void *p, uptr sz) {

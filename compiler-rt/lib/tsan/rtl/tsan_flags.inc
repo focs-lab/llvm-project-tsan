@@ -37,6 +37,14 @@ TSAN_FLAG(bool, report_atomic_races, true,
           "Report races between atomic and plain memory accesses.")
 TSAN_FLAG(bool, one_word_filter, false,
           "Keep one-word heap histories outside the regular shadow.")
+TSAN_FLAG(bool, ownership_profile, false,
+          "Measure per-cell thread ownership without changing race detection.")
+TSAN_FLAG(bool, ownership_profile_allocations, true,
+          "Treat the allocating thread as the initial cell owner.")
+TSAN_FLAG(bool, ownership_profile_wait_for_range, false,
+          "Ignore accesses until __tsan_ownership_profile_set_range is called.")
+TSAN_FLAG(const char *, ownership_profile_path, "",
+          "Write ownership-profile JSON to this file instead of stderr.")
 TSAN_FLAG(
     bool, force_seq_cst_atomics, false,
     "If set, all atomics are effectively sequentially consistent (seq_cst), "

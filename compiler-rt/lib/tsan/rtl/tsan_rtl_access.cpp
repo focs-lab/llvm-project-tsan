@@ -12,6 +12,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "tsan_rtl.h"
+#include "tsan_ownership_profile.h"
 
 namespace __tsan {
 
@@ -413,6 +414,8 @@ char* DumpShadow(char* buf, RawShadow raw) {
 // no frame setup, etc).
 NOINLINE void TraceRestartMemoryAccess(ThreadState* thr, uptr pc, uptr addr,
                                        uptr size, AccessType typ) {
+  if (UNLIKELY(ownership_profile_enabled))
+    OwnershipProfileRestartAccess(thr);
   TraceSwitchPart(thr);
   MemoryAccess(thr, pc, addr, size, typ);
 }
@@ -541,6 +544,8 @@ ALWAYS_INLINE USED void MemoryAccess(ThreadState* thr, uptr pc, uptr addr,
   FastState fast_state = thr->fast_state;
   Shadow cur(fast_state, addr, size, typ);
   bool traced = false;
+  if (UNLIKELY(ownership_profile_enabled))
+    OwnershipProfileBeginAccess(thr, typ);
 
   if (UNLIKELY(one_word::Enabled(addr))) {
     if (UNLIKELY(fast_state.GetIgnoreBit()))
@@ -569,7 +574,12 @@ ALWAYS_INLINE USED void MemoryAccess(ThreadState* thr, uptr pc, uptr addr,
   }
 
   LOAD_CURRENT_SHADOW(cur, shadow_mem);
-  if (LIKELY(ContainsSameAccess(shadow_mem, cur, shadow, access, typ)))
+  bool contains_same =
+      ContainsSameAccess(shadow_mem, cur, shadow, access, typ);
+  if (UNLIKELY(ownership_profile_enabled))
+    OwnershipProfileAccess(thr, addr, shadow_mem, typ, cur.raw(),
+                           contains_same, true);
+  if (LIKELY(contains_same))
     return;
   if (UNLIKELY(fast_state.GetIgnoreBit()))
     return;
@@ -583,6 +593,8 @@ void MemoryAccess16(ThreadState* thr, uptr pc, uptr addr, AccessType typ);
 NOINLINE
 void RestartMemoryAccess16(ThreadState* thr, uptr pc, uptr addr,
                            AccessType typ) {
+  if (UNLIKELY(ownership_profile_enabled))
+    OwnershipProfileRestartAccess(thr);
   TraceSwitchPart(thr);
   MemoryAccess16(thr, pc, addr, typ);
 }
@@ -593,13 +605,20 @@ ALWAYS_INLINE USED void MemoryAccess16(ThreadState* thr, uptr pc, uptr addr,
   FastState fast_state = thr->fast_state;
   if (UNLIKELY(fast_state.GetIgnoreBit()))
     return;
+  if (UNLIKELY(ownership_profile_enabled))
+    OwnershipProfileBeginAccess(thr, typ);
   one_word::HandOverRange(addr, size);
   Shadow cur(fast_state, 0, 8, typ);
   RawShadow* shadow_mem = MemToShadow(addr);
   bool traced = false;
   {
     LOAD_CURRENT_SHADOW(cur, shadow_mem);
-    if (LIKELY(ContainsSameAccess(shadow_mem, cur, shadow, access, typ)))
+    bool contains_same =
+        ContainsSameAccess(shadow_mem, cur, shadow, access, typ);
+    if (UNLIKELY(ownership_profile_enabled))
+      OwnershipProfileAccess(thr, addr, shadow_mem, typ, cur.raw(),
+                             contains_same, false);
+    if (LIKELY(contains_same))
       goto SECOND;
     if (!TryTraceMemoryAccessRange(thr, pc, addr, size, typ))
       return RestartMemoryAccess16(thr, pc, addr, typ);
@@ -610,7 +629,12 @@ ALWAYS_INLINE USED void MemoryAccess16(ThreadState* thr, uptr pc, uptr addr,
 SECOND:
   shadow_mem += kShadowCnt;
   LOAD_CURRENT_SHADOW(cur, shadow_mem);
-  if (LIKELY(ContainsSameAccess(shadow_mem, cur, shadow, access, typ)))
+  bool contains_same =
+      ContainsSameAccess(shadow_mem, cur, shadow, access, typ);
+  if (UNLIKELY(ownership_profile_enabled))
+    OwnershipProfileAccess(thr, addr + kShadowCell, shadow_mem, typ, cur.raw(),
+                           contains_same, false);
+  if (LIKELY(contains_same))
     return;
   if (!traced && !TryTraceMemoryAccessRange(thr, pc, addr, size, typ))
     return RestartMemoryAccess16(thr, pc, addr, typ);
@@ -620,6 +644,8 @@ SECOND:
 NOINLINE
 void RestartUnalignedMemoryAccess(ThreadState* thr, uptr pc, uptr addr,
                                   uptr size, AccessType typ) {
+  if (UNLIKELY(ownership_profile_enabled))
+    OwnershipProfileRestartAccess(thr);
   TraceSwitchPart(thr);
   UnalignedMemoryAccess(thr, pc, addr, size, typ);
 }
@@ -631,6 +657,8 @@ ALWAYS_INLINE USED void UnalignedMemoryAccess(ThreadState* thr, uptr pc,
   FastState fast_state = thr->fast_state;
   if (UNLIKELY(fast_state.GetIgnoreBit()))
     return;
+  if (UNLIKELY(ownership_profile_enabled))
+    OwnershipProfileBeginAccess(thr, typ);
   one_word::HandOverRange(addr, size);
   RawShadow* shadow_mem = MemToShadow(addr);
   bool traced = false;
@@ -638,7 +666,12 @@ ALWAYS_INLINE USED void UnalignedMemoryAccess(ThreadState* thr, uptr pc,
   {
     Shadow cur(fast_state, addr, size1, typ);
     LOAD_CURRENT_SHADOW(cur, shadow_mem);
-    if (LIKELY(ContainsSameAccess(shadow_mem, cur, shadow, access, typ)))
+    bool contains_same =
+        ContainsSameAccess(shadow_mem, cur, shadow, access, typ);
+    if (UNLIKELY(ownership_profile_enabled))
+      OwnershipProfileAccess(thr, addr, shadow_mem, typ, cur.raw(),
+                             contains_same, false);
+    if (LIKELY(contains_same))
       goto SECOND;
     if (!TryTraceMemoryAccessRange(thr, pc, addr, size, typ))
       return RestartUnalignedMemoryAccess(thr, pc, addr, size, typ);
@@ -653,7 +686,13 @@ SECOND:
   shadow_mem += kShadowCnt;
   Shadow cur(fast_state, 0, size2, typ);
   LOAD_CURRENT_SHADOW(cur, shadow_mem);
-  if (LIKELY(ContainsSameAccess(shadow_mem, cur, shadow, access, typ)))
+  bool contains_same =
+      ContainsSameAccess(shadow_mem, cur, shadow, access, typ);
+  uptr second_addr = RoundDown(addr, kShadowCell) + kShadowCell;
+  if (UNLIKELY(ownership_profile_enabled))
+    OwnershipProfileAccess(thr, second_addr, shadow_mem, typ, cur.raw(),
+                           contains_same, false);
+  if (LIKELY(contains_same))
     return;
   if (!traced && !TryTraceMemoryAccessRange(thr, pc, addr, size, typ))
     return RestartUnalignedMemoryAccess(thr, pc, addr, size, typ);
@@ -727,6 +766,8 @@ void MemoryResetRange(ThreadState* thr, uptr pc, uptr addr, uptr size) {
   uptr size1 = RoundUp(size + addr - addr1, kShadowCell);
   MemoryRangeSet(addr1, size1, Shadow::kEmpty);
   one_word::SetRange(addr1, size1, 0);
+  if (UNLIKELY(ownership_profile_enabled))
+    OwnershipProfileResetRange(addr1, size1);
 }
 
 void MemoryRangeFreed(ThreadState* thr, uptr pc, uptr addr, uptr size) {
@@ -799,10 +840,15 @@ void MemoryRangeImitateWriteOrResetRange(ThreadState* thr, uptr pc, uptr addr,
 }
 
 ALWAYS_INLINE
-bool MemoryAccessRangeOne(ThreadState* thr, RawShadow* shadow_mem, Shadow cur,
-                          AccessType typ) {
+bool MemoryAccessRangeOne(ThreadState* thr, uptr addr, RawShadow* shadow_mem,
+                          Shadow cur, AccessType typ) {
   LOAD_CURRENT_SHADOW(cur, shadow_mem);
-  if (LIKELY(ContainsSameAccess(shadow_mem, cur, shadow, access, typ)))
+  bool contains_same =
+      ContainsSameAccess(shadow_mem, cur, shadow, access, typ);
+  if (UNLIKELY(ownership_profile_enabled))
+    OwnershipProfileAccess(thr, addr, shadow_mem, typ, cur.raw(),
+                           contains_same, false);
+  if (LIKELY(contains_same))
     return false;
   return CheckRaces(thr, shadow_mem, cur, shadow, access, typ);
 }
@@ -810,6 +856,8 @@ bool MemoryAccessRangeOne(ThreadState* thr, RawShadow* shadow_mem, Shadow cur,
 template <bool is_read>
 NOINLINE void RestartMemoryAccessRange(ThreadState* thr, uptr pc, uptr addr,
                                        uptr size) {
+  if (UNLIKELY(ownership_profile_enabled))
+    OwnershipProfileRestartAccess(thr);
   TraceSwitchPart(thr);
   MemoryAccessRangeT<is_read>(thr, pc, addr, size);
 }
@@ -865,6 +913,9 @@ void MemoryAccessRangeT(ThreadState* thr, uptr pc, uptr addr, uptr size) {
   if (UNLIKELY(fast_state.GetIgnoreBit()))
     return;
 
+  if (UNLIKELY(ownership_profile_enabled))
+    OwnershipProfileBeginAccess(thr, typ);
+
   one_word::HandOverRange(addr, size);
 
   if (!TryTraceMemoryAccessRange(thr, pc, addr, size, typ))
@@ -875,20 +926,22 @@ void MemoryAccessRangeT(ThreadState* thr, uptr pc, uptr addr, uptr size) {
     uptr size1 = Min(size, RoundUp(addr, kShadowCell) - addr);
     size -= size1;
     Shadow cur(fast_state, addr, size1, typ);
-    if (UNLIKELY(MemoryAccessRangeOne(thr, shadow_mem, cur, typ)))
+    if (UNLIKELY(MemoryAccessRangeOne(thr, addr, shadow_mem, cur, typ)))
       return;
+    addr += size1;
     shadow_mem += kShadowCnt;
   }
   // Handle middle part, if any.
   Shadow cur(fast_state, 0, kShadowCell, typ);
   for (; size >= kShadowCell; size -= kShadowCell, shadow_mem += kShadowCnt) {
-    if (UNLIKELY(MemoryAccessRangeOne(thr, shadow_mem, cur, typ)))
+    if (UNLIKELY(MemoryAccessRangeOne(thr, addr, shadow_mem, cur, typ)))
       return;
+    addr += kShadowCell;
   }
   // Handle ending, if any.
   if (UNLIKELY(size)) {
     Shadow cur(fast_state, 0, size, typ);
-    if (UNLIKELY(MemoryAccessRangeOne(thr, shadow_mem, cur, typ)))
+    if (UNLIKELY(MemoryAccessRangeOne(thr, addr, shadow_mem, cur, typ)))
       return;
   }
 }

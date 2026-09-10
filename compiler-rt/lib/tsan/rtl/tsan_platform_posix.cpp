@@ -20,6 +20,7 @@
 #  include "sanitizer_common/sanitizer_errno.h"
 #  include "sanitizer_common/sanitizer_libc.h"
 #  include "sanitizer_common/sanitizer_procmaps.h"
+#  include "tsan_ownership_profile.h"
 #  include "tsan_platform.h"
 #  include "tsan_rtl.h"
 
@@ -101,6 +102,7 @@ void InitializeShadowMemory() {
             (OneWordEnd() - OneWordBeg()) >> 30);
   }
 
+  InitializeOwnershipProfile();
   InitializeShadowMemoryPlatform();
 
   on_initialize = reinterpret_cast<void (*)(void)>(
