@@ -37,6 +37,9 @@ void SANITIZER_CDECL __tsan_aba_pool_alloc(void *addr);
 // Annotate return of a slot, before it goes back on the freelist.
 void SANITIZER_CDECL __tsan_aba_pool_free(void *addr);
 
+// Number of ABA reports issued so far by the calling thread.
+unsigned long long SANITIZER_CDECL __tsan_aba_report_count(void);
+
 // Annotations for custom mutexes.
 // The annotations allow to get better reports (with sets of locked mutexes),
 // detect more types of bugs (e.g. mutex misuses, races between lock/unlock and

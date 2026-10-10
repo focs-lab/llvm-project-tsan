@@ -58,6 +58,10 @@ struct AbaCache {
 __attribute__((tls_model("initial-exec")))
 extern THREADLOCAL AbaCache aba_cache;
 
+// Per-thread count of ABA reports; lets tests attribute a report to one CAS.
+__attribute__((tls_model("initial-exec")))
+extern THREADLOCAL u64 aba_report_count;
+
 static inline uptr AbaSetIndex(uptr addr) {
   return (addr >> 3) & (kAbaSets - 1);  // atomics are >= pointer-aligned
 }
@@ -108,6 +112,7 @@ static inline void AbaCheckCas(uptr addr, uptr expected) {
         "==================\n",
         (void *)expected, (void *)addr, (unsigned long long)e->epoch,
         (unsigned long long)now);
+    aba_report_count++;
     e->addr = 0;  // consume; don't re-report this slot
   }
 }

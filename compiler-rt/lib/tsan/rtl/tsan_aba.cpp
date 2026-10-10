@@ -25,6 +25,9 @@ atomic_uint64_t g_aba_epoch = {1};
 __attribute__((tls_model("initial-exec")))
 THREADLOCAL AbaCache aba_cache;
 
+__attribute__((tls_model("initial-exec")))
+THREADLOCAL u64 aba_report_count;
+
 // Pool slot side table. Open addressing with a fixed probe window; removal
 // zeroes the slot rather than leaving a tombstone. Lookups must therefore scan
 // the whole window and never stop early, or a removal could hide a live entry
@@ -122,5 +125,6 @@ void __tsan_aba_pool_alloc(void *addr) {
 
 SANITIZER_INTERFACE_ATTRIBUTE
 void __tsan_aba_pool_free(void *addr) { PoolRemove((uptr)addr); }
-
+SANITIZER_INTERFACE_ATTRIBUTE
+unsigned long long __tsan_aba_report_count(void) { return aba_report_count; }
 }  // extern "C"
