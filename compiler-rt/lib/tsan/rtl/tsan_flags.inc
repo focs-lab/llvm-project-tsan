@@ -119,3 +119,26 @@ TSAN_FLAG(const char*, adaptive_delay_max_atomic, "sleep_us=50",
 TSAN_FLAG(const char*, adaptive_delay_max_sync, "sleep_us=500",
           "Delay for sync operations: 'spin=N' (max N spins), 'yield', or "
           "'sleep_us=N' (max N>0 us sleep)")
+
+TSAN_FLAG(bool, atomic_load_skip, false,
+          "ALS: an acquire-order atomic load skips the slot lock, the sync "
+          "object's reader lock and the clock acquire when this thread has "
+          "already acquired the sync object's clock in its present state "
+          "(a version word per sync object, a small cache per thread).")
+TSAN_FLAG(int, atomic_load_skip_cache, 64,
+          "ALS: entries of the per-thread cache of acquired clocks (a power "
+          "of two, 1 to 256; direct-mapped by address). Which clocks a "
+          "thread remembers changes how often it hits, not what a hit means.")
+TSAN_FLAG(bool, atomic_load_skip_verify, false,
+          "ALS, for tests: on a hit do the acquire anyway and die if it "
+          "changes the thread's clock.")
+TSAN_FLAG(bool, atomic_load_census, false,
+          "ALS: count atomic loads by order and outcome and print the counts "
+          "at exit (works with atomic_load_skip off, where every load with a "
+          "sync object is counted as it would have been classified).")
+TSAN_FLAG(const char *, atomic_load_mutant, "",
+          "ALS, for tests only: a named defect (no-bump-join: a release that "
+          "joins into a sync object's clock leaves its version; no-slot-check: "
+          "a hit does not look whether the thread still owns its slot; "
+          "no-empty: a reset leaves no version, as before the empty one "
+          "existed).")

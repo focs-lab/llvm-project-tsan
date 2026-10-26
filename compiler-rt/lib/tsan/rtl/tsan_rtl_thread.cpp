@@ -228,6 +228,7 @@ void ThreadFinish(ThreadState *thr) {
   if (thr->tls_addr && thr->tls_size)
     DontNeedShadowFor(thr->tls_addr, thr->tls_size);
   thr->is_dead = true;
+  AlsThreadReset(thr, true);
 #if !SANITIZER_GO
   thr->is_inited = false;
   thr->ignore_interceptors++;

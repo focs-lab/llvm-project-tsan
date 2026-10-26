@@ -37,8 +37,126 @@ void SyncVar::Reset() {
   last_lock.Reset();
   recursion = 0;
   atomic_store_relaxed(&flags, 0);
+  // ALS: the clock goes. Init comes through here too, so a new sync object
+  // starts empty. No load can be between this object's value and its version
+  // here except one racing a free of the object, which is the premise.
+  if (UNLIKELY(als_track))
+    atomic_store(&als_ver, kAlsEmpty, memory_order_release);
   Free(clock);
   Free(read_clock);
+}
+
+// ALS (atomic_load_skip). See AtomicLoad in tsan_interface_atomic.cpp.
+bool als_on, als_census, als_verify, als_track, als_no_bump_join;
+uptr als_cache_mask = 63;
+static bool als_no_slot_check;
+static atomic_uint64_t als_ver_next;  // blocks of versions, handed to threads
+static atomic_uintptr_t als_total[kAlsCnt];
+
+bool AlsMutant(const char *name) {
+  const char *m = flags()->atomic_load_mutant;
+  return UNLIKELY(m[0]) && !internal_strcmp(m, name);
+}
+
+// A hit takes no slot lock, and the slot lock is where a thread learns that
+// its slot was taken by another thread or emptied by a reset and attaches
+// anew (SlotLock). So a hit is allowed only to a thread that still owns its
+// slot, at an epoch that needs no re-attach: otherwise its later accesses
+// would be stamped with a (sid, epoch) another thread now runs under (audit
+// A84 F1). slot->thr is written under the slot's mutex; it is read here
+// without it, as SlotLock's first test would find it an instant later.
+bool AlsOwnsSlot(ThreadState *thr) {
+  if (UNLIKELY(als_no_slot_check))
+    return true;
+  TidSlot *slot = thr->slot;
+  return LIKELY(slot && __atomic_load_n(&slot->thr, __ATOMIC_RELAXED) == thr &&
+                thr->fast_state.epoch() != kEpochLast);
+}
+
+void AlsInit() {
+  als_on = flags()->atomic_load_skip;
+  als_census = flags()->atomic_load_census;
+  als_verify = flags()->atomic_load_skip_verify;
+  als_track = als_on | als_census;
+  // The largest power of two not above the flag, within the array.
+  uptr n =
+      flags()->atomic_load_skip_cache < 1 ? 1 : flags()->atomic_load_skip_cache;
+  if (n > 256)
+    n = 256;
+  while (n & (n - 1)) n &= n - 1;
+  als_cache_mask = n - 1;
+  als_no_slot_check = AlsMutant("no-slot-check");
+  als_no_bump_join = AlsMutant("no-bump-join");
+  atomic_store(&als_ver_next, kAlsEmpty + 1, memory_order_relaxed);
+}
+
+// A version no other clock state has: threads take them in blocks, so the
+// shared counter is written once per 2^16 clock changes of a thread.
+u64 AlsFreshVer(ThreadState *thr) {
+  if (UNLIKELY(thr->als_ver_next == thr->als_ver_end)) {
+    thr->als_ver_next =
+        atomic_fetch_add(&als_ver_next, 1 << 16, memory_order_relaxed);
+    thr->als_ver_end = thr->als_ver_next + (1 << 16);
+  }
+  return thr->als_ver_next++;
+}
+
+// The thread's clock was reset, or the thread ends: what it had acquired is
+// forgotten. Its counts join the census.
+void AlsThreadReset(ThreadState *thr, bool counts) {
+  if (als_track)
+    internal_memset(thr->als_cache, 0, sizeof(thr->als_cache));
+  if (counts && als_census)
+    for (uptr i = 0; i < kAlsCnt; i++) {
+      atomic_fetch_add(&als_total[i], thr->als_cnt[i], memory_order_relaxed);
+      thr->als_cnt[i] = 0;
+    }
+}
+
+void AlsPrintStats(ThreadState *thr) {
+  if (!als_census)
+    return;
+  AlsThreadReset(thr, true);
+  struct Live {
+    ThreadState *self;
+    uptr n;
+  } lv = {thr, 0};
+  {
+    // Threads still running are counted as they stand, unsynchronized.
+    ThreadRegistryLock l(&ctx->thread_registry);
+    ctx->thread_registry.RunCallbackForEachThreadLocked(
+        [](ThreadContextBase *b, void *arg) {
+          Live *lv = static_cast<Live *>(arg);
+          ThreadContext *t = static_cast<ThreadContext *>(b);
+          if (t->status != ThreadStatusRunning || !t->thr || t->thr == lv->self)
+            return;
+          lv->n++;
+          for (uptr i = 0; i < kAlsCnt; i++)
+            atomic_fetch_add(
+                &als_total[i],
+                __atomic_load_n(&t->thr->als_cnt[i], __ATOMIC_RELAXED),
+                memory_order_relaxed);
+        },
+        &lv);
+  }
+  uptr c[kAlsCnt];
+  for (uptr i = 0; i < kAlsCnt; i++)
+    c[i] = atomic_load(&als_total[i], memory_order_relaxed);
+  Printf(
+      "ThreadSanitizer: ALS census (skip %s): atomic loads: %zu relaxed, "
+      "%zu acquire-order with no sync object, %zu with a sync object: "
+      "%zu hits on a clock the thread had acquired, %zu hits on an empty "
+      "clock, misses: %zu address not in the thread's cache, %zu "
+      "version changed since the thread acquired it, %zu clock being "
+      "written, %zu the thread no "
+      "longer owned its slot; release-order "
+      "stores %zu, release-order RMW and CAS %zu; %zu threads still "
+      "running, counted as they stood\n",
+      als_on ? "on" : "off", c[kAlsRelaxed], c[kAlsNoSync],
+      c[kAlsHit] + c[kAlsHitEmpty] + c[kAlsMissNew] + c[kAlsMissChanged] +
+          c[kAlsMissZero] + c[kAlsMissSlot],
+      c[kAlsHit], c[kAlsHitEmpty], c[kAlsMissNew], c[kAlsMissChanged],
+      c[kAlsMissZero], c[kAlsMissSlot], c[kAlsStore], c[kAlsRmw], lv.n);
 }
 
 MetaMap::MetaMap()
@@ -174,6 +292,13 @@ void MetaMap::ResetClocks() {
   internal_memset(&cache, 0, sizeof(cache));
   internal_allocator()->InitCache(&cache);
   sync_alloc_.ForEach([&](SyncVar *s) {
+    // ALS: every clock is dropped, so no version survives a reset: each
+    // sync object is empty again. (Every slot mutex is held here, so no
+    // release-order writer is between its AlsBegin and AlsEnd.)
+    if (UNLIKELY(als_track) && LIKELY(!AlsMutant("no-empty")))
+      atomic_store(&s->als_ver, kAlsEmpty, memory_order_release);
+    else if (UNLIKELY(als_track))
+      atomic_store(&s->als_ver, 0, memory_order_release);
     if (s->clock) {
       InternalFree(s->clock, &cache);
       s->clock = nullptr;

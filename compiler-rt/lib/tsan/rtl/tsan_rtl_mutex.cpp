@@ -239,6 +239,7 @@ int MutexUnlock(ThreadState *thr, uptr pc, uptr addr, u32 flagz) {
           s->owner_tid = kInvalidTid;
           if (!thr->ignore_sync) {
             thr->clock.ReleaseStore(&s->clock);
+            AlsBump(thr, s);
             released = true;
           }
         }
@@ -391,6 +392,7 @@ void MutexReadOrWriteUnlock(ThreadState *thr, uptr pc, uptr addr) {
           s->owner_tid = kInvalidTid;
           if (!thr->ignore_sync) {
             thr->clock.ReleaseStore(&s->clock);
+            AlsBump(thr, s);
             released = true;
           }
         }
@@ -468,6 +470,8 @@ void Release(ThreadState *thr, uptr pc, uptr addr) {
     auto s = ctx->metamap.GetSyncOrCreate(thr, pc, addr, false);
     Lock lock(&s->mtx);
     thr->clock.Release(&s->clock);
+    if (LIKELY(!als_no_bump_join))
+      AlsBump(thr, s);
   }
   IncrementEpoch(thr);
 }
@@ -481,6 +485,7 @@ void ReleaseStore(ThreadState *thr, uptr pc, uptr addr) {
     auto s = ctx->metamap.GetSyncOrCreate(thr, pc, addr, false);
     Lock lock(&s->mtx);
     thr->clock.ReleaseStore(&s->clock);
+    AlsBump(thr, s);
   }
   IncrementEpoch(thr);
 }
@@ -494,6 +499,7 @@ void ReleaseStoreAcquire(ThreadState *thr, uptr pc, uptr addr) {
     auto s = ctx->metamap.GetSyncOrCreate(thr, pc, addr, false);
     Lock lock(&s->mtx);
     thr->clock.ReleaseStoreAcquire(&s->clock);
+    AlsBump(thr, s);
   }
   IncrementEpoch(thr);
 }

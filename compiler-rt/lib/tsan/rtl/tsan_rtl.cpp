@@ -316,6 +316,7 @@ void SlotAttachAndLock(ThreadState* thr) {
   if (thr->slot_epoch != ctx->global_epoch) {
     thr->slot_epoch = ctx->global_epoch;
     thr->clock.Reset();
+    AlsThreadReset(thr, false);  // nothing is acquired any more
 #if !SANITIZER_GO
     thr->last_sleep_stack_id = kInvalidStackID;
     thr->last_sleep_clock.Reset();
@@ -721,6 +722,7 @@ void Initialize(ThreadState *thr) {
   CacheBinaryName();
   CheckASLR();
   InitializeFlags(&ctx->flags, options, env_name);
+  AlsInit();
   AvoidCVE_2016_2143();
   __sanitizer::InitializePlatformEarly();
   __tsan::InitializePlatformEarly();
@@ -816,6 +818,7 @@ int Finalize(ThreadState *thr) {
 #endif
 
   ThreadFinalize(thr);
+  AlsPrintStats(thr);
 
   if (u32 nreported = atomic_load_relaxed(&ctx->nreported)) {
     failed = true;

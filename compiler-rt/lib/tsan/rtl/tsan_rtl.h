@@ -244,6 +244,17 @@ struct alignas(SANITIZER_CACHE_LINE_SIZE) ThreadState {
   AdaptiveDelayState adaptive_delay_state;
 
   explicit ThreadState(Tid tid);
+
+  // ALS (atomic_load_skip), kept after the hot fields: sync object clocks
+  // this thread has acquired, by address and version; a hit means an Acquire
+  // now would change nothing. Forgotten when `clock` is reset. Then a block
+  // of unused versions, and the thread's census counts.
+  struct AlsEntry {
+    uptr addr;
+    u64 ver;
+  } als_cache[256];  // als_cache_mask + 1 of them are used
+  u64 als_ver_next, als_ver_end;
+  u64 als_cnt[10];
 };
 
 #if !SANITIZER_GO
@@ -604,6 +615,74 @@ void ReleaseStoreAcquire(ThreadState *thr, uptr pc, uptr addr);
 void ReleaseStore(ThreadState *thr, uptr pc, uptr addr);
 void AfterSleep(ThreadState *thr, uptr pc);
 void IncrementEpoch(ThreadState *thr);
+
+// ALS (atomic_load_skip), tsan_sync.cpp.
+enum {
+  kAlsRelaxed,
+  kAlsNoSync,
+  kAlsHit,
+  kAlsHitEmpty,
+  kAlsMissNew,
+  kAlsMissChanged,
+  kAlsMissZero,
+  kAlsMissSlot,
+  kAlsStore,
+  kAlsRmw,
+  kAlsCnt
+};
+// The version of a sync object whose clock is null and at rest: a join with
+// it changes no thread's clock, so a load needs no record of having made it.
+const u64 kAlsEmpty = 1;
+// als_track: versions are kept (the skip or the census is on).
+extern bool als_on, als_census, als_verify, als_track, als_no_bump_join;
+extern uptr als_cache_mask;
+bool AlsMutant(const char *name);
+void AlsInit();
+u64 AlsFreshVer(ThreadState *thr);
+bool AlsOwnsSlot(ThreadState *thr);
+void AlsThreadReset(ThreadState *thr, bool counts);
+void AlsPrintStats(ThreadState *thr);
+// A writer of s->clock, under s->mtx held for writing. Begin before anything
+// the writer does can be seen by a load (its value, its clock); End after
+// both: a load that sees the writer's value then sees version 0 or the new
+// one, never the old one.
+ALWAYS_INLINE u64 AlsBegin(SyncVar *s) {
+  if (LIKELY(!als_track))
+    return 0;
+  const u64 old = atomic_load(&s->als_ver, memory_order_relaxed);
+  atomic_store(&s->als_ver, 0, memory_order_release);
+  // The 0 must be visible before the value the operation then writes. A
+  // release store does not order later stores, and an exchange
+  // (__sync_lock_test_and_set) is only an acquire barrier, but a release
+  // fence suffices: an acquire load that reads the value of an atomic write
+  // sequenced after the fence synchronizes with the fence, so the 0
+  // happens before the version load that follows that load (AtomicLoad),
+  // which then reads 0 or a later version. Loads never write the version,
+  // so no store-load (seq_cst) ordering is needed; on x86 this fence is a
+  // compiler barrier only.
+  atomic_thread_fence(memory_order_release);
+  return old;
+}
+// changed: the clock was written. Otherwise the version found is put back.
+ALWAYS_INLINE void AlsEnd(ThreadState *thr, SyncVar *s, u64 old, bool changed) {
+  if (LIKELY(!als_track))
+    return;
+  atomic_store(&s->als_ver, changed ? AlsFreshVer(thr) : old,
+               memory_order_release);
+}
+// A clock change with no value a load could have read first (mutex paths).
+ALWAYS_INLINE void AlsBump(ThreadState *thr, SyncVar *s) {
+  if (UNLIKELY(als_track)) {
+    atomic_store(&s->als_ver, AlsFreshVer(thr), memory_order_release);
+    // Release() may be followed by a relaxed store of the value a load then
+    // reads: the new version must be visible first. A release fence
+    // suffices, as in AlsBegin: the later write (that store, or the real
+    // unlock of a mutex) is atomic, and the load that reads it is acquire.
+    // A plain store after __tsan_release() is still ordered after the
+    // version in hardware, and an atomic load of it races in any case.
+    atomic_thread_fence(memory_order_release);
+  }
+}
 
 #if !SANITIZER_GO
 uptr ALWAYS_INLINE HeapEnd() {

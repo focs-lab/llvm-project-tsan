@@ -236,6 +236,9 @@ static T AtomicRMW(ThreadState *thr, uptr pc, volatile T *a, T v, morder mo) {
   {
     auto s = ctx->metamap.GetSyncOrCreate(thr, pc, (uptr)a, false);
     RWLock lock(&s->mtx, IsReleaseOrder(mo));
+    // ALS: only a release order holds the lock for writing and writes the
+    // clock; an acquire-only RMW leaves the version alone.
+    const u64 als_old = IsReleaseOrder(mo) ? AlsBegin(s) : 0;
     if (IsAcqRelOrder(mo))
       thr->clock.ReleaseAcquire(&s->clock);
     else if (IsReleaseOrder(mo))
@@ -243,6 +246,11 @@ static T AtomicRMW(ThreadState *thr, uptr pc, volatile T *a, T v, morder mo) {
     else if (IsAcquireOrder(mo))
       thr->clock.Acquire(s->clock);
     v = F(a, v);
+    if (IsReleaseOrder(mo)) {
+      AlsEnd(thr, s, als_old, LIKELY(!als_no_bump_join));
+      if (UNLIKELY(als_census))
+        thr->als_cnt[kAlsRmw]++;
+    }
   }
   if (IsReleaseOrder(mo))
     IncrementEpoch(thr);
@@ -268,6 +276,8 @@ struct OpLoad {
     // This fast-path is critical for performance.
     // Assume the access is atomic.
     if (!IsAcquireOrder(mo)) {
+      if (UNLIKELY(als_census))
+        thr->als_cnt[kAlsRelaxed]++;
       MemoryAccess(thr, pc, (uptr)a, AccessSize<T>(),
                    kAccessRead | kAccessAtomic);
       return NoTsanAtomic(mo, a);
@@ -277,12 +287,83 @@ struct OpLoad {
     T v = NoTsanAtomic(mo, a);
     SyncVar *s = ctx->metamap.GetSyncIfExists((uptr)a);
     if (s) {
-      SlotLocker locker(thr);
-      ReadLock lock(&s->mtx);
-      thr->clock.Acquire(s->clock);
-      // Re-read under sync mutex because we need a consistent snapshot
-      // of the value and the clock we acquire.
-      v = NoTsanAtomic(mo, a);
+      // ALS (atomic_load_skip). The version read here, after the value, names
+      // a state of s->clock this thread has already acquired: the join below
+      // would change nothing (the thread's clock only grows until it is
+      // reset, and a reset empties the cache), so it is skipped with the two
+      // locks that guard it. A writer that made the value read above set the
+      // version to 0 before the value was visible and to a new one after its
+      // clock change, so this load saw 0 or the new one, and the version
+      // cached cannot be either.
+      ThreadState::AlsEntry *e = nullptr;
+      u64 ver = 0;
+      bool hit = false;
+      if (UNLIKELY(als_track)) {
+        // ORDER: the version is read BEFORE AlsOwnsSlot looks at the slot. A
+        // global reset clears every slot's thr (DoResetImpl) before
+        // ResetClocks stores the empty version; a load that reads the
+        // reset's "empty" and only then its slot therefore finds the slot
+        // gone and takes the slow path, where it attaches anew. With the two
+        // reads swapped it could find the slot still its own, then read
+        // "empty", and go on under a (sid, epoch) the reset has retired.
+        ver = atomic_load(&s->als_ver, memory_order_acquire);
+        e = &thr->als_cache[((uptr)a >> 3) & als_cache_mask];
+        // An empty clock needs no record: joining it changes nothing.
+        const bool empty = ver == kAlsEmpty;
+        const bool known =
+            empty || (ver != 0 && e->addr == (uptr)a && e->ver == ver);
+        hit = known && AlsOwnsSlot(thr);
+        if (UNLIKELY(als_census))
+          thr->als_cnt[hit                  ? (empty ? kAlsHitEmpty : kAlsHit)
+                       : known              ? kAlsMissSlot
+                       : ver == 0           ? kAlsMissZero
+                       : e->addr == (uptr)a ? kAlsMissChanged
+                                            : kAlsMissNew]++;
+        if (!als_on) {
+          // Census with the skip off: keep the cache as the skip would, so
+          // that the counts say what it would have done; take the slow path.
+          hit = false;
+        }
+      }
+      if (LIKELY(!hit) || UNLIKELY(als_verify)) {
+        SlotLocker locker(thr);
+        ReadLock lock(&s->mtx);
+        // atomic_load_skip_verify: the acquire a hit skips must be a no-op.
+        // The hit was decided before the locks; a release or a reset that
+        // completed since then changed the version, and then the join below
+        // is the one a later load would have made, not the one skipped.
+        if (UNLIKELY(hit) &&
+            atomic_load(&s->als_ver, memory_order_relaxed) == ver) {
+          VectorClock before;
+          before = thr->clock;
+          thr->clock.Acquire(s->clock);
+          if (internal_memcmp(&before, &thr->clock, sizeof(before))) {
+            Printf(
+                "ThreadSanitizer: ALS verify: a hit on %p (version %llu) "
+                "would have skipped an acquire that changes the clock\n",
+                (void *)a, ver);
+            Die();
+          }
+        } else {
+          thr->clock.Acquire(s->clock);
+        }
+        // Re-read under sync mutex because we need a consistent snapshot
+        // of the value and the clock we acquire.
+        v = NoTsanAtomic(mo, a);
+        if (e) {
+          // What was acquired: the state the version names now (stable under
+          // the reader lock; 0 is never cached). The empty version is not
+          // cached either: it hits by itself, and the entry may hold another
+          // address the thread still loads.
+          const u64 now = atomic_load(&s->als_ver, memory_order_relaxed);
+          if (now > kAlsEmpty) {
+            e->addr = (uptr)a;
+            e->ver = now;
+          }
+        }
+      }
+    } else if (UNLIKELY(als_census)) {
+      thr->als_cnt[kAlsNoSync]++;
     }
     MemoryAccess(thr, pc, (uptr)a, AccessSize<T>(),
                  kAccessRead | kAccessAtomic);
@@ -320,8 +401,12 @@ struct OpStore {
     {
       auto s = ctx->metamap.GetSyncOrCreate(thr, pc, (uptr)a, false);
       Lock lock(&s->mtx);
+      const u64 als_old = AlsBegin(s);
       thr->clock.ReleaseStore(&s->clock);
       NoTsanAtomic(mo, a, v);
+      AlsEnd(thr, s, als_old, true);
+      if (UNLIKELY(als_census))
+        thr->als_cnt[kAlsStore]++;
     }
     IncrementEpoch(thr);
   }
@@ -461,6 +546,8 @@ struct OpCAS {
     {
       auto s = ctx->metamap.GetSyncOrCreate(thr, pc, (uptr)a, false);
       RWLock lock(&s->mtx, release);
+      // ALS: before the exchange, whose value a load may read at once.
+      const u64 als_old = release ? AlsBegin(s) : 0;
       T cc = *c;
       T pr = func_cas(a, cc, v);
       success = pr == cc;
@@ -474,6 +561,12 @@ struct OpCAS {
         thr->clock.Release(&s->clock);
       else if (IsAcquireOrder(mo))
         thr->clock.Acquire(s->clock);
+      if (release) {
+        // A failed exchange wrote neither the value nor the clock.
+        AlsEnd(thr, s, als_old, success && LIKELY(!als_no_bump_join));
+        if (UNLIKELY(als_census) && success)
+          thr->als_cnt[kAlsRmw]++;
+      }
     }
     if (success && release)
       IncrementEpoch(thr);
