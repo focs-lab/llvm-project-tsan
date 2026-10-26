@@ -166,6 +166,30 @@ define void @store_via_local_then_global_escape() nounwind uwtable sanitize_thre
 ; CHECK: call void @__tsan_write4(ptr %x)
 ; CHECK: call void @__tsan_read4(ptr %x)
 
+; A mixed provenance set needs a runtime guard: accesses to the two local
+; allocas skip the callback, while an access through the argument keeps it.
+define void @mixed_safe_and_escaping(i1 %pick_safe, i1 %pick_a, ptr %b)
+    nounwind uwtable sanitize_thread {
+entry:
+  %a = alloca i32, align 4
+  %c = alloca i32, align 4
+  %safe = select i1 %pick_a, ptr %a, ptr %c
+  %ptr = select i1 %pick_safe, ptr %safe, ptr %b
+  store i32 7, ptr %ptr, align 4
+  ret void
+}
+; CHECK-LABEL: define void @mixed_safe_and_escaping
+; CHECK: %[[MATCH_A:.*]] = icmp eq ptr %ptr, %a
+; CHECK: br i1 %[[MATCH_A]], label %[[CONT_BLOCK:.*]], label %[[CHECK_BLOCK:.*]]
+; CHECK: [[CHECK_BLOCK]]:
+; CHECK: %[[MATCH_C:.*]] = icmp eq ptr %ptr, %c
+; CHECK: br i1 %[[MATCH_C]], label %[[CONT_BLOCK]], label %[[CALLBACK_BLOCK:.*]]
+; CHECK: [[CALLBACK_BLOCK]]:
+; CHECK: call void @__tsan_write4(ptr %ptr)
+; CHECK: br label %[[CONT_BLOCK]]
+; CHECK: [[CONT_BLOCK]]:
+; CHECK: store i32 7, ptr %ptr, align 4
+
 ; =============================================================================
 ; ATOMICS, VOLATILE, AND BAIL-OUTS
 ; =============================================================================

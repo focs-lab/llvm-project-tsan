@@ -31,6 +31,7 @@
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/Function.h"
+#include "llvm/IR/InstIterator.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
@@ -40,8 +41,10 @@
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Type.h"
 #include "llvm/ProfileData/InstrProf.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/EscapeEnumerator.h"
 #include "llvm/Transforms/Utils/Instrumentation.h"
 #include "llvm/Transforms/Utils/Local.h"
@@ -156,6 +159,7 @@ private:
 
     Instruction *Inst;
     unsigned Flags = 0;
+    SmallVector<const AllocaInst *, 2> SafeAllocaBases;
   };
 
   void initialize(Module &M, const TargetLibraryInfo &TLI);
@@ -173,6 +177,7 @@ private:
   EscapeAnalysisInfo *EAI = nullptr;
   MemorySSA *MSSA = nullptr;
   LoopInfo *LI = nullptr;
+  SmallPtrSet<const AllocaInst *, 8> AllocasWithLifetimeMarkers;
 
   Type *IntptrTy;
   FunctionCallee TsanFuncEntry;
@@ -449,6 +454,7 @@ bool ThreadSanitizer::addrPointsToConstantData(Value *Addr) {
 //  - read-before-write (within same BB, no calls between)
 //  - not captured variables
 //  - non-escaping allocations (if -tsan-use-escape-analysis)
+//  - accesses with both safe and escaping allocas (guarded at runtime)
 //
 // We do not handle some of the patterns that should not survive
 // after the classic compiler optimizations.
@@ -500,6 +506,7 @@ void ThreadSanitizer::chooseInstructionsToInstrument(
     // gated by -tsan-omit-by-pointer-capturing; -tsan-use-escape-analysis
     // selects the more precise EscapeAnalysis-based implementation over the
     // legacy CaptureTracking check.
+    SmallVector<const AllocaInst *, 2> SafeAllocaBases;
     if (ClOmitNonCaptured) {
       if (ClUseEscapeAnalysis) {
         SmallPtrSet<const Value *, 8> BaseObjs;
@@ -513,8 +520,32 @@ void ThreadSanitizer::chooseInstructionsToInstrument(
         for (const Value *Obj : BaseObjs) {
           if (EAI->isEscaping(*Obj)) {
             IsEscaped = true;
-            break;
+            continue;
           }
+          // We check if the underlying object is an alloca instruction
+          // So that we can safely ensure that it can be used in the runtime guard later on. (Restrict to objects whose address is expected to be stable)
+          const auto *AI = dyn_cast<AllocaInst>(Obj);
+          // Restrict guards to live-range-stable, entry-block static allocas.
+          // Interior pointers conservatively keep their TSan callback.
+          // If it is not a static alloca, we have to send it for instrumentation
+          if (!AI || !AI->isStaticAlloca())
+            continue;
+          auto AllocationSize =
+              AI->getAllocationSize(I->getModule()->getDataLayout());
+          // Reject if the size is unknown, scalable (size only known at runtime), zero, or if the alloca has lifetime (start or end) markers (adds extra complexity to the analysis).
+          if (!AllocationSize || AllocationSize->isScalable() ||
+              AllocationSize->getFixedValue() == 0 ||
+              AllocasWithLifetimeMarkers.contains(AI) ||
+              // Reject if the alloca is not in the entry block (so we can assume it is live for the whole function)
+              // or if its type does not match the access type (for easier comparison later), or if it is in the same block but comes after the instruction.
+              AI->getParent() != &I->getFunction()->getEntryBlock() ||
+              AI->getType() != Addr->getType() ||
+              (AI->getParent() == I->getParent() && !AI->comesBefore(I)))
+            continue;
+          // We record it as safe if they are all non-escaping, static allocas.
+          // Size is known, fixed and non-zero, no lifetime start or end markers
+          // Is in the entry block, type matches the access type, and comes before the access instruction in the same block.
+          SafeAllocaBases.push_back(AI);
         }
         if (!IsEscaped) {
           NumOmittedByEscapeAnalysis++;
@@ -535,6 +566,7 @@ void ThreadSanitizer::chooseInstructionsToInstrument(
 
     // Instrument this instruction.
     All.emplace_back(I);
+    All.back().SafeAllocaBases = std::move(SafeAllocaBases);
     if (IsWrite) {
       // For read-before-write and compound instrumentation we only need one
       // write target, and we can override any previous entry if it exists.
@@ -582,6 +614,16 @@ bool ThreadSanitizer::sanitizeFunction(Function &F) {
     return false;
 
   initialize(*F.getParent(), TLI);
+  AllocasWithLifetimeMarkers.clear();
+  for (Instruction &Inst : instructions(F)) {
+    if (!Inst.isLifetimeStartOrEnd())
+      continue;
+    // If it is a lifetime marker, we record the underlying alloca as having lifetime markers, so we can avoid using it as a safe alloca later on.
+    auto *Lifetime = cast<IntrinsicInst>(&Inst);
+    if (const auto *AI =
+            dyn_cast<AllocaInst>(getUnderlyingObject(Lifetime->getArgOperand(1))))
+      AllocasWithLifetimeMarkers.insert(AI);
+  }
   SmallVector<InstructionInfo, 8> AllLoadsAndStores;
   SmallVector<Instruction*, 8> LocalLoadsAndStores;
   SmallVector<Instruction*, 8> AtomicAccesses;
@@ -668,6 +710,48 @@ bool ThreadSanitizer::instrumentLoadOrStore(const InstructionInfo &II,
                         : cast<LoadInst>(II.Inst)->getPointerOperand();
   Type *OrigTy = getLoadStoreType(II.Inst);
 
+  auto CreateTsanCall = [&](FunctionCallee Callee,
+                            ArrayRef<Value *> Args) -> CallInst * {
+    if (II.SafeAllocaBases.empty())
+      return IRB.CreateCall(Callee, Args);
+
+    DebugLoc InstDL = IRB.getCurrentDebugLocation();
+    BasicBlock *CheckBB = II.Inst->getParent();
+    BasicBlock *ContinueBB = SplitBlock(CheckBB, II.Inst);
+    CheckBB->getTerminator()->eraseFromParent();
+    
+    // Starts the list with the check block
+    SmallVector<BasicBlock *, 4> CheckBlocks = {CheckBB};
+    for (size_t I = 1; I < II.SafeAllocaBases.size(); ++I)
+      // Creates a new block for the next safe alloca base, which will be used to check if the runtime address matches any of the safe allocas. If it does, we can skip the instrumentation.
+      CheckBlocks.push_back(BasicBlock::Create(
+          IRB.getContext(), "tsan.safe.check", II.Inst->getFunction(),
+          ContinueBB));
+
+    // Creates a block for instrumentation if all checks fail
+    BasicBlock *CallbackBB = BasicBlock::Create(
+        IRB.getContext(), "tsan.callback", II.Inst->getFunction(), ContinueBB);
+
+    for (size_t I = 0; I < II.SafeAllocaBases.size(); ++I) {
+      InstrumentationIRBuilder CheckIRB(CheckBlocks[I], CheckBlocks[I]->end());
+      CheckIRB.SetCurrentDebugLocation(InstDL);
+      Value *MatchesBase = CheckIRB.CreateICmpEQ(
+          Addr, const_cast<AllocaInst *>(II.SafeAllocaBases[I]));
+      // Creates the destination block for the conditional branch. If this is the last check, we branch to the callback block, otherwise we branch to the next check block.
+      BasicBlock *OnNoMatch =
+          I + 1 < CheckBlocks.size() ? CheckBlocks[I + 1] : CallbackBB;
+      // If it matches, we skip the instrumentation and go to the continue block, otherwise we go to the next check block (i.e. checking if next alloca matches) or the callback block (instrumentation) if this is the last check.
+      CheckIRB.CreateCondBr(MatchesBase, ContinueBB, OnNoMatch);
+    }
+    // Calls TSan callback in the callback block, and then branches to the continue block.
+    InstrumentationIRBuilder CallbackIRB(CallbackBB, CallbackBB->end());
+    CallbackIRB.SetCurrentDebugLocation(InstDL);
+    CallInst *Call = CallbackIRB.CreateCall(Callee, Args);
+    // Continue holds the orginal instruction with no callback (will be called either ways)
+    CallbackIRB.CreateBr(ContinueBB);
+    return Call;
+  };
+
   // swifterror memory addresses are mem2reg promoted by instruction selection.
   // As such they cannot have regular uses like an instrumentation function and
   // it makes no sense to track them as memory.
@@ -689,12 +773,14 @@ bool ThreadSanitizer::instrumentLoadOrStore(const InstructionInfo &II,
     if (StoredValue->getType()->isIntegerTy())
       StoredValue = IRB.CreateIntToPtr(StoredValue, IRB.getPtrTy());
     // Call TsanVptrUpdate.
-    IRB.CreateCall(TsanVptrUpdate, {Addr, StoredValue});
+    Value *Args[] = {Addr, StoredValue};
+    CreateTsanCall(TsanVptrUpdate, Args);
     NumInstrumentedVtableWrites++;
     return true;
   }
   if (!IsWrite && isVtableAccess(II.Inst)) {
-    IRB.CreateCall(TsanVptrLoad, Addr);
+    Value *Args[] = {Addr};
+    CreateTsanCall(TsanVptrLoad, Args);
     NumInstrumentedVtableReads++;
     return true;
   }
@@ -726,7 +812,8 @@ bool ThreadSanitizer::instrumentLoadOrStore(const InstructionInfo &II,
     else
       OnAccessFunc = IsWrite ? TsanUnalignedWrite[Idx] : TsanUnalignedRead[Idx];
   }
-  IRB.CreateCall(OnAccessFunc, Addr);
+  Value *Args[] = {Addr};
+  CreateTsanCall(OnAccessFunc, Args);
   if (IsCompoundRW || IsWrite)
     NumInstrumentedWrites++;
   if (IsCompoundRW || !IsWrite)
