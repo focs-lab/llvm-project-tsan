@@ -20,21 +20,44 @@
 
 namespace __sanitizer {
 
-typedef TwoLevelBitVector<> DDBV;  // DeadlockDetector's bit vector.
+// DeadlockDetector's bit vector, and so its node table: 4096 nodes by default;
+// DDFlags::large_table selects 16384 (TwoLevelBitVector<4>; the detector then
+// takes about 41 MB instead of 4 MB). More nodes mean fewer epoch flushes, and
+// a flush forgets every edge, so a cycle whose edges span one is reported only
+// once it is rebuilt: the large table can report earlier. Its reports are not
+// a superset of the default table's, for two reasons. Edges can enter the
+// graph without a cycle check (a recursive read lock; a read lock taken
+// through a post-lock with no pre-lock, as pthread_rwlock_timedrdlock's; a
+// check and an insert racing across threads); the default table's flush makes
+// it re-check them and report, while the large table keeps them and its fast
+// path returns. And the large table flushes too, at other points: a flush of
+// its own between a -> b and b -> a forgets a -> b where the default table may
+// have kept both.
+typedef TwoLevelBitVector<> DDBV;
+typedef TwoLevelBitVector<4> DDBVLarge;
 
 struct DDPhysicalThread {
 };
 
-struct DDLogicalThread {
+// The detector's per-thread state is opaque to its user; each instantiation
+// has its own.
+struct DDLogicalThread {};
+
+template <class BV>
+struct DDLogicalThreadT : DDLogicalThread {
   u64 ctx;
-  DeadlockDetectorTLS<DDBV> dd;
+  DeadlockDetectorTLS<BV> dd;
   DDReport rep;
   bool report_pending;
 };
 
+template <class BV>
 struct DD final : public DDetector {
+  typedef DDLogicalThreadT<BV> LT;
+  static LT *L(DDLogicalThread *lt) { return static_cast<LT *>(lt); }
+
   SpinMutex mtx;
-  DeadlockDetector<DDBV> dd;
+  DeadlockDetector<BV> dd;
   DDFlags flags;
 
   explicit DD(const DDFlags *flags);
@@ -53,56 +76,72 @@ struct DD final : public DDetector {
   void MutexDestroy(DDCallback *cb, DDMutex *m) override;
 
   DDReport *GetReport(DDCallback *cb) override;
+  // The test MutexBeforeLock starts with.
+  bool HoldsNoLock(DDLogicalThread *lt) override { return L(lt)->dd.empty(); }
+  uptr GraphFlushes() override {
+    SpinMutexLock lk(&mtx);
+    return dd.flushes();
+  }
 
-  void MutexEnsureID(DDLogicalThread *lt, DDMutex *m);
+  void MutexEnsureID(LT *lt, DDMutex *m);
   void ReportDeadlock(DDCallback *cb, DDMutex *m);
 };
 
-DDetector *DDetector::Create(const DDFlags *flags) {
-  (void)flags;
-  void *mem = MmapOrDie(sizeof(DD), "deadlock detector");
-  return new(mem) DD(flags);
+template <class BV>
+static DDetector *CreateDD(const DDFlags *flags) {
+  void *mem = MmapOrDie(sizeof(DD<BV>), "deadlock detector");
+  return new (mem) DD<BV>(flags);
 }
 
-DD::DD(const DDFlags *flags)
-    : flags(*flags) {
+DDetector *DDetector::Create(const DDFlags *flags) {
+  return flags->large_table ? CreateDD<DDBVLarge>(flags)
+                            : CreateDD<DDBV>(flags);
+}
+
+template <class BV>
+DD<BV>::DD(const DDFlags *flags) : flags(*flags) {
   dd.clear();
 }
 
-DDPhysicalThread* DD::CreatePhysicalThread() {
+template <class BV>
+DDPhysicalThread *DD<BV>::CreatePhysicalThread() {
   return nullptr;
 }
 
-void DD::DestroyPhysicalThread(DDPhysicalThread *pt) {
-}
+template <class BV>
+void DD<BV>::DestroyPhysicalThread(DDPhysicalThread *pt) {}
 
-DDLogicalThread* DD::CreateLogicalThread(u64 ctx) {
-  DDLogicalThread *lt = (DDLogicalThread*)InternalAlloc(sizeof(*lt));
+template <class BV>
+DDLogicalThread *DD<BV>::CreateLogicalThread(u64 ctx) {
+  LT *lt = (LT *)InternalAlloc(sizeof(*lt));
   lt->ctx = ctx;
   lt->dd.clear();
   lt->report_pending = false;
   return lt;
 }
 
-void DD::DestroyLogicalThread(DDLogicalThread *lt) {
-  lt->~DDLogicalThread();
+template <class BV>
+void DD<BV>::DestroyLogicalThread(DDLogicalThread *lt) {
+  L(lt)->~LT();
   InternalFree(lt);
 }
 
-void DD::MutexInit(DDCallback *cb, DDMutex *m) {
+template <class BV>
+void DD<BV>::MutexInit(DDCallback *cb, DDMutex *m) {
   m->id = 0;
   m->stk = cb->Unwind();
 }
 
-void DD::MutexEnsureID(DDLogicalThread *lt, DDMutex *m) {
+template <class BV>
+void DD<BV>::MutexEnsureID(LT *lt, DDMutex *m) {
   if (!dd.nodeBelongsToCurrentEpoch(m->id))
     m->id = dd.newNode(reinterpret_cast<uptr>(m));
   dd.ensureCurrentEpoch(&lt->dd);
 }
 
-void DD::MutexBeforeLock(DDCallback *cb,
-    DDMutex *m, bool wlock) {
-  DDLogicalThread *lt = cb->lt;
+template <class BV>
+void DD<BV>::MutexBeforeLock(DDCallback *cb, DDMutex *m, bool wlock) {
+  LT *lt = L(cb->lt);
   if (lt->dd.empty()) return;  // This will be the first lock held by lt.
   if (dd.hasAllEdges(&lt->dd, m->id)) return;  // We already have all edges.
   SpinMutexLock lk(&mtx);
@@ -116,8 +155,9 @@ void DD::MutexBeforeLock(DDCallback *cb,
   }
 }
 
-void DD::ReportDeadlock(DDCallback *cb, DDMutex *m) {
-  DDLogicalThread *lt = cb->lt;
+template <class BV>
+void DD<BV>::ReportDeadlock(DDCallback *cb, DDMutex *m) {
+  LT *lt = L(cb->lt);
   uptr path[20];
   uptr len = dd.findPathToLock(&lt->dd, m->id, path, ARRAY_SIZE(path));
   if (len == 0U) {
@@ -149,8 +189,10 @@ void DD::ReportDeadlock(DDCallback *cb, DDMutex *m) {
   }
 }
 
-void DD::MutexAfterLock(DDCallback *cb, DDMutex *m, bool wlock, bool trylock) {
-  DDLogicalThread *lt = cb->lt;
+template <class BV>
+void DD<BV>::MutexAfterLock(DDCallback *cb, DDMutex *m, bool wlock,
+                            bool trylock) {
+  LT *lt = L(cb->lt);
   u32 stk = 0;
   if (flags.second_deadlock_stack)
     stk = cb->Unwind();
@@ -169,13 +211,14 @@ void DD::MutexAfterLock(DDCallback *cb, DDMutex *m, bool wlock, bool trylock) {
   dd.onLockAfter(&lt->dd, m->id, stk);
 }
 
-void DD::MutexBeforeUnlock(DDCallback *cb, DDMutex *m, bool wlock) {
+template <class BV>
+void DD<BV>::MutexBeforeUnlock(DDCallback *cb, DDMutex *m, bool wlock) {
   // Printf("T%p MutexUnLock: %zx\n", cb->lt, m->id);
-  dd.onUnlock(&cb->lt->dd, m->id);
+  dd.onUnlock(&L(cb->lt)->dd, m->id);
 }
 
-void DD::MutexDestroy(DDCallback *cb,
-    DDMutex *m) {
+template <class BV>
+void DD<BV>::MutexDestroy(DDCallback *cb, DDMutex *m) {
   if (!m->id) return;
   SpinMutexLock lk(&mtx);
   if (dd.nodeBelongsToCurrentEpoch(m->id))
@@ -183,11 +226,13 @@ void DD::MutexDestroy(DDCallback *cb,
   m->id = 0;
 }
 
-DDReport *DD::GetReport(DDCallback *cb) {
-  if (!cb->lt->report_pending)
+template <class BV>
+DDReport *DD<BV>::GetReport(DDCallback *cb) {
+  LT *lt = L(cb->lt);
+  if (!lt->report_pending)
     return nullptr;
-  cb->lt->report_pending = false;
-  return &cb->lt->rep;
+  lt->report_pending = false;
+  return &lt->rep;
 }
 
 } // namespace __sanitizer

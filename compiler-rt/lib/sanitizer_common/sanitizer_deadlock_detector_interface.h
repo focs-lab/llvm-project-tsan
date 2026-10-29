@@ -47,6 +47,8 @@ struct DDMutex {
 
 struct DDFlags {
   bool second_deadlock_stack;
+  // Detector 1: a node table of 16384 mutexes instead of 4096.
+  bool large_table;
 };
 
 struct DDReport {
@@ -88,6 +90,14 @@ struct DDetector {
   virtual void MutexDestroy(DDCallback *cb, DDMutex *m) {}
 
   virtual DDReport *GetReport(DDCallback *cb) { return nullptr; }
+
+  // Whether lt holds no lock the detector tracks: then MutexBeforeLock has
+  // nothing to do. A detector that cannot tell cheaply says false.
+  virtual bool HoldsNoLock(DDLogicalThread *lt) { return false; }
+
+  // How often the detector forgot its lock-order graph to make room, for
+  // statistics; 0 when it does not flush or cannot tell.
+  virtual uptr GraphFlushes() { return 0; }
 
  protected:
   ~DDetector() {}

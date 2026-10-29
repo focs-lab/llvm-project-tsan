@@ -391,6 +391,7 @@ void SlotUnlock(ThreadState* thr) {
 Context::Context()
     : initialized(),
       nreported(),
+      dd_prelock_skips(),
       thread_registry([](Tid tid) -> ThreadContextBase* {
         return new (Alloc(sizeof(ThreadContext))) ThreadContext(tid);
       }),
@@ -432,6 +433,7 @@ ThreadState::ThreadState(Tid tid)
 #endif
   shadow_stack_pos = shadow_stack;
   shadow_stack_end = shadow_stack + kInitStackSize;
+  dd_prelock_skips = 0;
 }
 
 #if !SANITIZER_GO
@@ -795,6 +797,27 @@ void MaybeSpawnBackgroundThread() {
 #endif
 }
 
+// Adds the skipped pre-lock hooks of a thread that is still running to *arg.
+static void SumLivePrelockSkips(ThreadContextBase* tctx_base, void* arg) {
+  auto* tctx = static_cast<ThreadContext*>(tctx_base);
+  if (tctx->status != ThreadStatusRunning || !tctx->thr)
+    return;
+  *static_cast<u64*>(arg) += tctx->thr->dd_prelock_skips;
+}
+
+static void PrintDeadlockDetectorStats() {
+  u64 skips = atomic_load_relaxed(&ctx->dd_prelock_skips);
+  {
+    ThreadRegistryLock l(&ctx->thread_registry);
+    ctx->thread_registry.RunCallbackForEachThreadLocked(SumLivePrelockSkips,
+                                                        &skips);
+  }
+  Printf(
+      "ThreadSanitizer: deadlock detector: graph flushes=%zu, pre-lock "
+      "hooks skipped=%llu\n",
+      ctx->dd->GraphFlushes(), (unsigned long long)skips);
+}
+
 int Finalize(ThreadState *thr) {
   bool failed = false;
 
@@ -825,6 +848,9 @@ int Finalize(ThreadState *thr) {
     Printf("Found %u data race(s)\n", nreported);
 #endif
   }
+
+  if (flags()->print_deadlock_detector_stats && ctx->dd)
+    PrintDeadlockDetectorStats();
 
   if (common_flags()->print_suppressions)
     PrintMatchedSuppressions();

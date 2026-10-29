@@ -136,12 +136,33 @@ void MutexDestroy(ThreadState *thr, uptr pc, uptr addr, u32 flagz) {
   // s will be destroyed and freed in MetaMap::FreeBlock.
 }
 
+// Whether the pre-lock hook would change nothing: the detector's
+// MutexBeforeLock returns at its first test when the thread holds no lock it
+// tracks, and then no report can be pending either. What the hook would do
+// besides is look the SyncVar up, creating it if need be, and merge creation
+// flags into it; without creation flags the merge is a no-op. The creation is
+// not: a SyncVar that exists from the pre-lock on is what lets a concurrent
+// pthread_mutex_destroy, between this thread's pre-lock and post-lock, make
+// its imitated free-write, and so report the destroy-vs-lock race; without it
+// the destroy returns early. So the hook is left out only for
+// a SyncVar that already exists (a lock-free lookup, as MutexDestroy's own).
+static bool NothingForDetectorBeforeLock(ThreadState *thr, uptr addr,
+                                         u32 flagz) {
+  return flags()->deadlock_detector_exact_prelock &&
+         !(flagz & MutexCreationFlagMask) && ctx->dd->HoldsNoLock(thr->dd_lt) &&
+         ctx->metamap.GetSyncIfExists(addr) != nullptr;
+}
+
 void MutexPreLock(ThreadState *thr, uptr pc, uptr addr, u32 flagz) {
   DPrintf("#%d: MutexPreLock %zx flagz=0x%x\n", thr->tid, addr, flagz);
   if (flagz & MutexFlagTryLock)
     return;
   if (!common_flags()->detect_deadlocks)
     return;
+  if (NothingForDetectorBeforeLock(thr, addr, flagz)) {
+    thr->dd_prelock_skips++;
+    return;
+  }
   Callback cb(thr, pc);
   {
     SlotLocker locker(thr);
@@ -266,6 +287,10 @@ void MutexPreReadLock(ThreadState *thr, uptr pc, uptr addr, u32 flagz) {
   DPrintf("#%d: MutexPreReadLock %zx flagz=0x%x\n", thr->tid, addr, flagz);
   if ((flagz & MutexFlagTryLock) || !common_flags()->detect_deadlocks)
     return;
+  if (NothingForDetectorBeforeLock(thr, addr, flagz)) {
+    thr->dd_prelock_skips++;
+    return;
+  }
   Callback cb(thr, pc);
   {
     SlotLocker locker(thr);

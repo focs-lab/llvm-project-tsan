@@ -281,6 +281,8 @@ void ThreadContext::OnFinished() {
   // From now on replay will use trace->final_pos.
   trace.final_pos = (Event *)atomic_load_relaxed(&thr->trace_pos);
   atomic_store_relaxed(&thr->trace_pos, 0);
+  atomic_fetch_add(&ctx->dd_prelock_skips, thr->dd_prelock_skips,
+                   memory_order_relaxed);
   thr->tctx = nullptr;
   thr = nullptr;
 }

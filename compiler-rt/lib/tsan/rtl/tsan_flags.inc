@@ -23,6 +23,15 @@ TSAN_FLAG(bool, enable_annotations, true,
 TSAN_FLAG(bool, suppress_equal_stacks, true,
           "Suppress a race report if we've already output another race report "
           "with the same stack.")
+TSAN_FLAG(bool, deadlock_detector_exact_prelock, false,
+          "Skip the lock-order detector's pre-lock hook when the thread holds "
+          "no lock, the mutex has no creation flags to merge and its sync "
+          "object already exists: the hook would change nothing then (same "
+          "reports, same order)")
+TSAN_FLAG(bool, print_deadlock_detector_stats, false,
+          "Print at exit how often the lock-order detector flushed its graph "
+          "and how many pre-lock hooks deadlock_detector_exact_prelock "
+          "skipped")
 TSAN_FLAG(bool, report_bugs, true,
           "Turns off bug reporting entirely (useful for benchmarking).")
 TSAN_FLAG(bool, report_thread_leaks, true, "Report thread leaks at exit?")

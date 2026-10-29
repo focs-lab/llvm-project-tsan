@@ -75,6 +75,7 @@ void Flags::SetDefaults() {
 #undef TSAN_FLAG
   // DDFlags
   second_deadlock_stack = false;
+  large_table = false;
 }
 
 void RegisterTsanFlags(FlagParser *parser, Flags *f) {
@@ -86,6 +87,19 @@ void RegisterTsanFlags(FlagParser *parser, Flags *f) {
   RegisterFlag(parser, "second_deadlock_stack",
       "Report where each mutex is locked in deadlock reports",
       &f->second_deadlock_stack);
+  RegisterFlag(
+      parser, "deadlock_detector_large_table",
+      "Give the lock-order detector a table of 16384 mutexes instead of "
+      "4096 (about 41 MB instead of 4 MB, ~32.5 MB of it resident from "
+      "start-up, and +1.5 KB per thread): it forgets its graph less often. "
+      "It can report a lock-order inversion earlier, and it can miss one the "
+      "default table reports: one that the default table finds only because "
+      "a flush made it re-check edges that entered the graph unchecked (a "
+      "recursive read lock, pthread_rwlock_timedrdlock, or a check and "
+      "insert racing across threads), and one whose edges a flush of the "
+      "large table itself separates where the default table's flushes do "
+      "not. print_deadlock_detector_stats shows whether it flushed",
+      &f->large_table);
 }
 
 void InitializeFlags(Flags *f, const char *env, const char *env_option_name) {

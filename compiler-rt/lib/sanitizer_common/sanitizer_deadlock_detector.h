@@ -343,6 +343,12 @@ class DeadlockDetector {
     return dtls->getLocks(current_epoch_).getBit(nodeToIndex(node));
   }
 
+  // How often the graph was flushed because no node was free; taking the
+  // first epoch is not a flush.
+  uptr flushes() const {
+    return current_epoch_ ? current_epoch_ / size() - 1 : 0;
+  }
+
   uptr testOnlyGetEpoch() const { return current_epoch_; }
   bool testOnlyHasEdge(uptr l1, uptr l2) {
     return g_.hasEdge(nodeToIndex(l1), nodeToIndex(l2));

@@ -69,6 +69,7 @@ static void InitializeFlags() {
 
   // Default values.
   f->second_deadlock_stack = false;
+  f->large_table = false;
 
   SetCommonFlagsDefaults();
   {

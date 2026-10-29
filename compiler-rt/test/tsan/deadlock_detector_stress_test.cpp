@@ -1,12 +1,22 @@
 // RUN: %clangxx_tsan %s -o %t -DLockType=PthreadMutex
-// RUN: %deflake %run %t | FileCheck %s --check-prefix=CHECK --check-prefix=CHECK-NOT-SECOND
-// RUN: %env_tsan_opts=second_deadlock_stack=1 %deflake %run %t | FileCheck %s --check-prefix=CHECK --check-prefix=CHECK-SECOND
+// Each lock type runs with the default detector table (SMALL, pinned, so that
+// a harness turning the large table on for every test cannot flip it) and with
+// deadlock_detector_large_table=1 (LARGE). The tables differ in Test4 alone: it
+// churns through kDeadlockGraphSize = 4096 mutexes, which flushes the default
+// table's graph, so 0 -> 1 is forgotten and 1 -> 0 is silent; the large table
+// keeps the edge and reports the inversion.
+// RUN: %env_tsan_opts=deadlock_detector_large_table=0 %deflake %run %t | FileCheck %s --check-prefix=CHECK --check-prefix=CHECK-NOT-SECOND --check-prefix=SMALL
+// RUN: %env_tsan_opts=second_deadlock_stack=1:deadlock_detector_large_table=0 %deflake %run %t | FileCheck %s --check-prefix=CHECK --check-prefix=CHECK-SECOND --check-prefix=SMALL
+// RUN: %env_tsan_opts=deadlock_detector_large_table=1 %deflake %run %t | FileCheck %s --check-prefix=CHECK --check-prefix=CHECK-NOT-SECOND --check-prefix=LARGE
 // RUN: %clangxx_tsan %s -o %t -DLockType=PthreadSpinLock
-// RUN: %deflake %run %t | FileCheck %s
+// RUN: %env_tsan_opts=deadlock_detector_large_table=0 %deflake %run %t | FileCheck %s --check-prefix=CHECK --check-prefix=SMALL
+// RUN: %env_tsan_opts=deadlock_detector_large_table=1 %deflake %run %t | FileCheck %s --check-prefix=CHECK --check-prefix=LARGE
 // RUN: %clangxx_tsan %s -o %t -DLockType=PthreadRWLock
-// RUN: %deflake %run %t | FileCheck %s --check-prefix=CHECK --check-prefix=CHECK-RD
+// RUN: %env_tsan_opts=deadlock_detector_large_table=0 %deflake %run %t | FileCheck %s --check-prefix=CHECK --check-prefix=CHECK-RD --check-prefix=SMALL
+// RUN: %env_tsan_opts=deadlock_detector_large_table=1 %deflake %run %t | FileCheck %s --check-prefix=CHECK --check-prefix=CHECK-RD --check-prefix=LARGE
 // RUN: %clangxx_tsan %s -o %t -DLockType=PthreadRecursiveMutex
-// RUN: %deflake %run %t | FileCheck %s --check-prefix=CHECK --check-prefix=CHECK-REC
+// RUN: %env_tsan_opts=deadlock_detector_large_table=0 %deflake %run %t | FileCheck %s --check-prefix=CHECK --check-prefix=CHECK-REC --check-prefix=SMALL
+// RUN: %env_tsan_opts=deadlock_detector_large_table=1 %deflake %run %t | FileCheck %s --check-prefix=CHECK --check-prefix=CHECK-REC --check-prefix=LARGE
 #include "test.h"
 #undef NDEBUG
 #include <assert.h>
@@ -150,7 +160,7 @@ class LockTest {
   void Test1() {
     if (test_number > 0 && test_number != 1) return;
     fprintf(stderr, "Starting Test1\n");
-    // CHECK: Starting Test1
+    // CHECK-LABEL: Starting Test1{{($|[^0-9])}}
     Init(5);
     print_address("Expecting lock inversion: ", 2, A(0), A(1));
     // CHECK: Expecting lock inversion: [[A1:0x[a-f0-9]*]] [[A2:0x[a-f0-9]*]]
@@ -176,7 +186,7 @@ class LockTest {
   void Test2() {
     if (test_number > 0 && test_number != 2) return;
     fprintf(stderr, "Starting Test2\n");
-    // CHECK: Starting Test2
+    // CHECK-LABEL: Starting Test2{{($|[^0-9])}}
     Init(5);
     print_address("Expecting lock inversion: ", 3, A(0), A(1), A(2));
     // CHECK: Expecting lock inversion: [[A1:0x[a-f0-9]*]] [[A2:0x[a-f0-9]*]] [[A3:0x[a-f0-9]*]]
@@ -194,7 +204,7 @@ class LockTest {
   void Test3() {
     if (test_number > 0 && test_number != 3) return;
     fprintf(stderr, "Starting Test3\n");
-    // CHECK: Starting Test3
+    // CHECK-LABEL: Starting Test3{{($|[^0-9])}}
     Init(5);
     Lock_0_1();
     L(2);
@@ -210,20 +220,22 @@ class LockTest {
   void Test4() {
     if (test_number > 0 && test_number != 4) return;
     fprintf(stderr, "Starting Test4\n");
-    // CHECK: Starting Test4
+    // CHECK-LABEL: Starting Test4{{($|[^0-9])}}
     Init(5);
     Lock_0_1();
     L(2);
     CreateLockUnlockAndDestroyManyLocks();
     U(2);
     Lock_1_0();
-    // CHECK-NOT: WARNING: ThreadSanitizer:
+    // SMALL-NOT: WARNING: ThreadSanitizer:
+    // LARGE: WARNING: ThreadSanitizer: lock-order-inversion
+    // LARGE-NOT: WARNING: ThreadSanitizer:
   }
 
   void Test5() {
     if (test_number > 0 && test_number != 5) return;
     fprintf(stderr, "Starting Test5\n");
-    // CHECK: Starting Test5
+    // CHECK-LABEL: Starting Test5{{($|[^0-9])}}
     Init(5);
     RunThreads(&LockTest::Lock_0_1<true>, &LockTest::Lock_1_0<true>);
     // CHECK: WARNING: ThreadSanitizer: lock-order-inversion
@@ -238,7 +250,7 @@ class LockTest {
   void Test6() {
     if (test_number > 0 && test_number != 6) return;
     fprintf(stderr, "Starting Test6: 3 threads lock/unlock private mutexes\n");
-    // CHECK: Starting Test6
+    // CHECK-LABEL: Starting Test6{{($|[^0-9])}}
     Init(100);
     // CHECK-NOT: WARNING: ThreadSanitizer:
     RunThreads(&LockTest::Lock1_Loop_0, &LockTest::Lock1_Loop_1,
@@ -248,7 +260,7 @@ class LockTest {
   void Test7() {
     if (test_number > 0 && test_number != 7) return;
     fprintf(stderr, "Starting Test7\n");
-    // CHECK: Starting Test7
+    // CHECK-LABEL: Starting Test7{{($|[^0-9])}}
     Init(10);
     L(0); T(1); U(1); U(0);
     T(1); L(0); U(1); U(0);
@@ -280,7 +292,7 @@ class LockTest {
     if (!LockType::supports_read_lock()) return;
     fprintf(stderr, "Starting Test8\n");
     Init(5);
-    // CHECK-RD: Starting Test8
+    // CHECK-RD-LABEL: Starting Test8{{($|[^0-9])}}
     RL(0); L(1); RU(0); U(1);
     L(1); RL(0); RU(0); U(1);
     // CHECK-RD: WARNING: ThreadSanitizer: lock-order-inversion
@@ -298,7 +310,7 @@ class LockTest {
     if (test_number > 0 && test_number != 9) return;
     if (!LockType::supports_recursive_lock()) return;
     fprintf(stderr, "Starting Test9\n");
-    // CHECK-REC: Starting Test9
+    // CHECK-REC-LABEL: Starting Test9{{($|[^0-9])}}
     Init(5);
     L(0); L(0); L(0); L(1); U(1); U(0); U(0); U(0);
     L(1); L(1); L(1); L(0); U(0); U(1); U(1); U(1);
@@ -308,7 +320,7 @@ class LockTest {
   void Test10() {
     if (test_number > 0 && test_number != 10) return;
     fprintf(stderr, "Starting Test10: 4 threads lock/unlock 4 private mutexes, one under another\n");
-    // CHECK: Starting Test10
+    // CHECK-LABEL: Starting Test10{{($|[^0-9])}}
     Init(100);
     // CHECK-NOT: WARNING: ThreadSanitizer:
     RunThreads(&LockTest::Test10_Thread1, &LockTest::Test10_Thread2,
@@ -334,7 +346,7 @@ class LockTest {
   void Test11() {
     if (test_number > 0 && test_number != 11) return;
     fprintf(stderr, "Starting Test11: 4 threads lock/unlock 4 private mutexes, all under another private mutex\n");
-    // CHECK: Starting Test11
+    // CHECK-LABEL: Starting Test11{{($|[^0-9])}}
     Init(500);
     // CHECK-NOT: WARNING: ThreadSanitizer:
     RunThreads(&LockTest::Test11_Thread1, &LockTest::Test11_Thread2,
@@ -363,7 +375,7 @@ class LockTest {
     if (test_number > 0 && test_number != 12) return;
     if (!LockType::supports_read_lock()) return;
     fprintf(stderr, "Starting Test12: 4 threads read lock/unlock 4 shared mutexes, one under another\n");
-    // CHECK-RD: Starting Test12
+    // CHECK-RD-LABEL: Starting Test12{{($|[^0-9])}}
     Init(500);
     // CHECK-RD-NOT: WARNING: ThreadSanitizer:
     RunThreads(&LockTest::Test12_Thread, &LockTest::Test12_Thread,
@@ -386,7 +398,7 @@ class LockTest {
     if (test_number > 0 && test_number != 13) return;
     if (!LockType::supports_read_lock()) return;
     fprintf(stderr, "Starting Test13: 4 threads read lock/unlock 4 shared mutexes, all under another shared mutex\n");
-    // CHECK-RD: Starting Test13
+    // CHECK-RD-LABEL: Starting Test13{{($|[^0-9])}}
     Init(500);
     // CHECK-RD-NOT: WARNING: ThreadSanitizer:
     RunThreads(&LockTest::Test13_Thread, &LockTest::Test13_Thread,
@@ -411,7 +423,7 @@ class LockTest {
     if (test_number > 0 && test_number != 14) return;
     fprintf(stderr, "Starting Test14: create lots of locks in 4 threads\n");
     Init(10);
-    // CHECK-RD: Starting Test14
+    // CHECK-RD-LABEL: Starting Test14{{($|[^0-9])}}
     RunThreads(&LockTest::CreateAndDestroyLocksLoop,
                &LockTest::CreateAndDestroyLocksLoop,
                &LockTest::CreateAndDestroyLocksLoop,
@@ -432,7 +444,7 @@ class LockTest {
   void Test16() {
     if (test_number > 0 && test_number != 16) return;
     fprintf(stderr, "Starting Test16: detailed output test with two locks\n");
-    // CHECK: Starting Test16
+    // CHECK-LABEL: Starting Test16{{($|[^0-9])}}
     // CHECK: WARNING: ThreadSanitizer: lock-order-inversion
     // CHECK: acquired here while holding mutex
     // CHECK: LockTest::Acquire1
@@ -457,7 +469,7 @@ class LockTest {
   void Test17() {
     if (test_number > 0 && test_number != 17) return;
     fprintf(stderr, "Starting Test17: detailed output test with three locks\n");
-    // CHECK: Starting Test17
+    // CHECK-LABEL: Starting Test17{{($|[^0-9])}}
     // CHECK: WARNING: ThreadSanitizer: lock-order-inversion
     // CHECK: LockTest::Acquire1
     // CHECK-NEXT: LockTest::Acquire_0_then_1

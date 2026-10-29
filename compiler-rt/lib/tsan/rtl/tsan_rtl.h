@@ -210,6 +210,9 @@ struct alignas(SANITIZER_CACHE_LINE_SIZE) ThreadState {
   ThreadContext *tctx;
 
   DDLogicalThread *dd_lt;
+  // Pre-lock hooks deadlock_detector_exact_prelock skipped; added into
+  // Context in OnFinished.
+  u64 dd_prelock_skips;
 
   TidSlot *slot;
   uptr slot_epoch;
@@ -318,6 +321,8 @@ struct Context {
   MetaMap metamap;
 
   atomic_uint32_t nreported;
+  // ThreadState::dd_prelock_skips of the finished threads.
+  atomic_uint64_t dd_prelock_skips;
   atomic_uint64_t last_symbolize_time_ns;
 
   void *background_thread;
