@@ -38,20 +38,25 @@ void SyncVar::Reset() {
   recursion = 0;
   atomic_store_relaxed(&flags, 0);
   // ALS: the clock goes. Init comes through here too, so a new sync object
-  // starts empty. No load can be between this object's value and its version
-  // here except one racing a free of the object, which is the premise.
+  // starts untracked: no load has looked at it, and writers keep no version
+  // until one does. No load can be between this object's value and its
+  // version here except one racing a free of the object, which is the
+  // premise.
   if (UNLIKELY(als_track))
-    atomic_store(&als_ver, kAlsEmpty, memory_order_release);
+    atomic_store(&als_ver, kAlsUntracked, memory_order_release);
   Free(clock);
   Free(read_clock);
 }
 
 // ALS (atomic_load_skip). See AtomicLoad in tsan_interface_atomic.cpp.
-bool als_on, als_census, als_verify, als_track, als_no_bump_join;
+bool als_on, als_census, als_verify, als_track, als_wtrack, als_no_bump_join;
+bool als_no_empty, als_lazy_stale, als_lazy_skip_empty;
 uptr als_cache_mask = 63;
 static bool als_no_slot_check;
 static atomic_uint64_t als_ver_next;  // blocks of versions, handed to threads
 static atomic_uintptr_t als_total[kAlsCnt];
+static_assert(sizeof(ThreadState::als_cnt) == kAlsCnt * sizeof(u64),
+              "als_cnt holds one count per kind");
 
 bool AlsMutant(const char *name) {
   const char *m = flags()->atomic_load_mutant;
@@ -87,6 +92,10 @@ void AlsInit() {
   als_cache_mask = n - 1;
   als_no_slot_check = AlsMutant("no-slot-check");
   als_no_bump_join = AlsMutant("no-bump-join");
+  als_no_empty = AlsMutant("no-empty");
+  als_lazy_stale = AlsMutant("lazy-stale");
+  als_lazy_skip_empty = AlsMutant("lazy-skip-empty");
+  als_wtrack = als_track && !AlsMutant("lazy-skip-all");
   atomic_store(&als_ver_next, kAlsEmpty + 1, memory_order_relaxed);
 }
 
@@ -148,15 +157,17 @@ void AlsPrintStats(ThreadState *thr) {
       "%zu hits on a clock the thread had acquired, %zu hits on an empty "
       "clock, misses: %zu address not in the thread's cache, %zu "
       "version changed since the thread acquired it, %zu clock being "
-      "written, %zu the thread no "
+      "written or not yet tracked, %zu the thread no "
       "longer owned its slot; release-order "
-      "stores %zu, release-order RMW and CAS %zu; %zu threads still "
+      "stores %zu, release-order RMW and CAS %zu; %zu versions started; "
+      "%zu threads still "
       "running, counted as they stood\n",
       als_on ? "on" : "off", c[kAlsRelaxed], c[kAlsNoSync],
       c[kAlsHit] + c[kAlsHitEmpty] + c[kAlsMissNew] + c[kAlsMissChanged] +
           c[kAlsMissZero] + c[kAlsMissSlot],
       c[kAlsHit], c[kAlsHitEmpty], c[kAlsMissNew], c[kAlsMissChanged],
-      c[kAlsMissZero], c[kAlsMissSlot], c[kAlsStore], c[kAlsRmw], lv.n);
+      c[kAlsMissZero], c[kAlsMissSlot], c[kAlsStore], c[kAlsRmw], c[kAlsTrack],
+      lv.n);
 }
 
 MetaMap::MetaMap()
@@ -293,12 +304,16 @@ void MetaMap::ResetClocks() {
   internal_allocator()->InitCache(&cache);
   sync_alloc_.ForEach([&](SyncVar *s) {
     // ALS: every clock is dropped, so no version survives a reset: each
-    // sync object is empty again. (Every slot mutex is held here, so no
-    // release-order writer is between its AlsBegin and AlsEnd.)
-    if (UNLIKELY(als_track) && LIKELY(!AlsMutant("no-empty")))
-      atomic_store(&s->als_ver, kAlsEmpty, memory_order_release);
-    else if (UNLIKELY(als_track))
-      atomic_store(&s->als_ver, 0, memory_order_release);
+    // tracked sync object is empty again; an untracked one stays untracked
+    // (the load that starts it finds the clock null). (Every slot mutex is
+    // held here, so no release-order writer is between its AlsBegin and
+    // AlsEnd, and no load is starting a version.) Mutant no-empty: a reset
+    // leaves no version, and none is ever the empty one.
+    if (UNLIKELY(als_track) &&
+        atomic_load(&s->als_ver, memory_order_relaxed) != kAlsUntracked)
+      atomic_store(&s->als_ver,
+                   LIKELY(!als_no_empty) ? kAlsEmpty : kAlsUntracked,
+                   memory_order_release);
     if (s->clock) {
       InternalFree(s->clock, &cache);
       s->clock = nullptr;

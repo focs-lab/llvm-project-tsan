@@ -63,12 +63,14 @@ struct SyncVar {
   DDMutex dd;
   VectorClock *read_clock;  // Used for rw mutexes only.
   VectorClock *clock;
-  // ALS (atomic_load_skip): names the present state of `clock`. 0: being
-  // written, no state a load may rely on. kAlsEmpty: `clock` is null and
-  // nobody is writing it (a new sync object, a reset, a free). Any other
-  // value is unique in the process and is written, under mtx held for
-  // writing, after every change of `clock`. Read without a lock by
-  // AtomicLoad.
+  // ALS (atomic_load_skip): names the present state of `clock`. 0: no
+  // state a load may rely on: being written, or untracked (a new or freed
+  // sync object no load has looked at since; writers keep no version until
+  // one does). kAlsEmpty: `clock` is null and nobody is writing it (a
+  // reset, or a load found it null). Any other value is unique in the
+  // process and is written, under mtx held for writing, after every change
+  // of `clock` once the object is tracked. Read without a lock by
+  // AtomicLoad; set from 0 by a load under mtx held for reading.
   atomic_uint64_t als_ver;
 
   void Init(ThreadState *thr, uptr pc, uptr addr, bool save_stack);

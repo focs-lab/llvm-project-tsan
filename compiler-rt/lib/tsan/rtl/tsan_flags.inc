@@ -141,4 +141,8 @@ TSAN_FLAG(const char *, atomic_load_mutant, "",
           "joins into a sync object's clock leaves its version; no-slot-check: "
           "a hit does not look whether the thread still owns its slot; "
           "no-empty: a reset leaves no version, as before the empty one "
-          "existed).")
+          "existed; lazy-stale: the load that starts a sync object's "
+          "versions starts it at the empty one, whatever its clock; "
+          "lazy-skip-empty: writers keep no version of a sync object whose "
+          "version is the empty one; lazy-skip-all: writers keep no version "
+          "of any sync object).")

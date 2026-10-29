@@ -9,6 +9,10 @@
 //   store    W writes a plain global and then stores the atomic (release);
 //            main spins on acquire loads until it sees the value, then reads
 //            the global. The load that sees W's value must acquire: no race.
+//            Under the mutant lazy-skip-all writers keep no version of any
+//            sync object, so W's release leaves the version main's first
+//            load started, main's load is a hit, the acquire is skipped and
+//            the read of the global is reported as a race (also join, annot).
 //   join     the same with W's release a fetch_add (a join into the sync
 //            object's clock, not a copy). Under the mutant no-bump-join the
 //            join leaves the version, main's load is a hit, the acquire is
@@ -41,8 +45,10 @@
 //            main loads: the sync object is there and its clock is empty, so
 //            every load is a hit with nothing cached (a join with an empty
 //            clock changes nothing). Under the mutant no-empty a reset leaves
-//            "no version" and none of them hits. That a release after the
-//            reset is still acquired is the mode reset.
+//            no version (0, untracked): the first load after it starts a
+//            fresh version and the next 9 hit on it, so none hits on an
+//            empty clock. That a release after the reset is still acquired
+//            is the mode reset.
 //   cache    128 neighbouring atomics, each stored (release) and then loaded
 //            in turn, twice. With the default cache of 64 entries, mapped by
 //            address, two of them share every entry and each load evicts
@@ -54,20 +60,43 @@
 //            agrees: the size changes how often a load hits, nothing else.
 //   unsync   positive control for "no race": W never releases (a relaxed
 //            store), so the read of the global IS a race, skip on or off.
+//   untracked  (lazy versions) main stores and fetch_adds (release) and
+//            never loads: no load has looked at the sync object, so no
+//            version is kept for it (census: 0 versions started; hit: 1).
+//   lazyskip main's acquire-only fetch_add makes a sync object with a null
+//            clock; main's first load starts its versions at the empty one;
+//            then as store. W's release must leave a new version. Under the
+//            mutant lazy-skip-empty writers keep no version of an object
+//            whose version is the empty one (no load has it cached, but
+//            every load hits on it): main's load is a hit, the acquire is
+//            skipped and the read of the global is reported as a race.
+//   lazystale W writes the global and stores the atomic (release) before
+//            any load, so no version is kept. Then T loads (a miss: it
+//            acquires and starts the versions), and only then main loads
+//            (both orders by signals TSan does not see). The version T
+//            starts must name the clock it acquired: a fresh one. Under the
+//            mutant lazy-stale it is the empty one, as if the version the
+//            object had before any load looked at it were still good: main's
+//            load is a hit, the acquire is skipped and the read of the global
+//            is reported as a race.
 //
 // RUN: %clang_tsan -O1 %s -o %t
 // RUN: %run %t hit 2>&1 | FileCheck %s --check-prefix=CLEAN
-// RUN: %env_tsan_opts=atomic_load_skip=1:atomic_load_census=1 %run %t hit 2>&1 | FileCheck %s --check-prefixes=CLEAN,HITS
+// RUN: %env_tsan_opts=atomic_load_skip=1:atomic_load_census=1 %run %t hit 2>&1 | FileCheck %s --check-prefixes=CLEAN,HITS,TRACK1
 // RUN: %env_tsan_opts=atomic_load_census=1 %run %t hit 2>&1 | FileCheck %s --check-prefixes=CLEAN,HITS
 // RUN: %env_tsan_opts=atomic_load_skip=1:atomic_load_skip_verify=1 %run %t hit 2>&1 | FileCheck %s --check-prefix=CLEAN
 // RUN: %run %t store 2>&1 | FileCheck %s --check-prefix=CLEAN
 // RUN: %env_tsan_opts=atomic_load_skip=1:atomic_load_census=1 %run %t store 2>&1 | FileCheck %s --check-prefixes=CLEAN,HITS
 // RUN: %env_tsan_opts=atomic_load_skip=1:atomic_load_skip_verify=1 %run %t store 2>&1 | FileCheck %s --check-prefix=CLEAN
+// RUN: %env_tsan_opts=atomic_load_skip=1:atomic_load_mutant=lazy-skip-all %deflake %run %t store 2>&1 | FileCheck %s --check-prefix=RACE
+// RUN: %env_tsan_opts=atomic_load_skip=1:atomic_load_skip_verify=1:atomic_load_mutant=lazy-skip-all not %run %t store 2>&1 | FileCheck %s --check-prefix=VERIFY
 // RUN: %run %t join 2>&1 | FileCheck %s --check-prefix=CLEAN
 // RUN: %env_tsan_opts=atomic_load_skip=1:atomic_load_census=1 %run %t join 2>&1 | FileCheck %s --check-prefixes=CLEAN,HITS
 // RUN: %env_tsan_opts=atomic_load_skip=1:atomic_load_skip_verify=1 %run %t join 2>&1 | FileCheck %s --check-prefix=CLEAN
 // RUN: %env_tsan_opts=atomic_load_skip=1:atomic_load_mutant=no-bump-join %deflake %run %t join 2>&1 | FileCheck %s --check-prefix=RACE
 // RUN: %env_tsan_opts=atomic_load_skip=1:atomic_load_skip_verify=1:atomic_load_mutant=no-bump-join not %run %t join 2>&1 | FileCheck %s --check-prefix=VERIFY
+// RUN: %env_tsan_opts=atomic_load_skip=1:atomic_load_mutant=lazy-skip-all %deflake %run %t join 2>&1 | FileCheck %s --check-prefix=RACE
+// RUN: %env_tsan_opts=atomic_load_skip=1:atomic_load_skip_verify=1:atomic_load_mutant=lazy-skip-all not %run %t join 2>&1 | FileCheck %s --check-prefix=VERIFY
 // RUN: %run %t cas 2>&1 | FileCheck %s --check-prefix=CLEAN
 // RUN: %env_tsan_opts=atomic_load_skip=1:atomic_load_skip_verify=1 %run %t cas 2>&1 | FileCheck %s --check-prefix=CLEAN
 // RUN: %env_tsan_opts=atomic_load_skip=1:atomic_load_mutant=no-bump-join %deflake %run %t cas 2>&1 | FileCheck %s --check-prefix=RACE
@@ -77,6 +106,8 @@
 // RUN: %run %t annot 2>&1 | FileCheck %s --check-prefix=CLEAN
 // RUN: %env_tsan_opts=atomic_load_skip=1:atomic_load_skip_verify=1 %run %t annot 2>&1 | FileCheck %s --check-prefix=CLEAN
 // RUN: %env_tsan_opts=atomic_load_skip=1:atomic_load_mutant=no-bump-join %deflake %run %t annot 2>&1 | FileCheck %s --check-prefix=RACE
+// RUN: %env_tsan_opts=atomic_load_skip=1:atomic_load_mutant=lazy-skip-all %deflake %run %t annot 2>&1 | FileCheck %s --check-prefix=RACE
+// RUN: %env_tsan_opts=atomic_load_skip=1:atomic_load_skip_verify=1:atomic_load_mutant=lazy-skip-all not %run %t annot 2>&1 | FileCheck %s --check-prefix=VERIFY
 // RUN: %env_tsan_opts=atomic_load_skip=1:atomic_load_skip_verify=1:atomic_load_census=1 %run %t casfail 2>&1 | FileCheck %s --check-prefixes=CLEAN,HITS
 // RUN: %env_tsan_opts=atomic_load_census=1 %run %t steal 2>&1 | FileCheck %s --check-prefixes=DONE,SLOT
 // RUN: %env_tsan_opts=atomic_load_skip=1:atomic_load_census=1 %run %t steal 2>&1 | FileCheck %s --check-prefixes=DONE,SLOT
@@ -93,6 +124,17 @@
 // RUN: %env_tsan_opts=atomic_load_skip=1:atomic_load_skip_verify=1 %run %t reset 2>&1 | FileCheck %s --check-prefix=CLEAN
 // RUN: %deflake %run %t unsync 2>&1 | FileCheck %s --check-prefix=RACE
 // RUN: %env_tsan_opts=atomic_load_skip=1 %deflake %run %t unsync 2>&1 | FileCheck %s --check-prefix=RACE
+// RUN: %env_tsan_opts=atomic_load_skip=1:atomic_load_census=1 %run %t untracked 2>&1 | FileCheck %s --check-prefixes=CLEAN,TRACK0
+// RUN: %run %t lazyskip 2>&1 | FileCheck %s --check-prefix=CLEAN
+// RUN: %env_tsan_opts=atomic_load_skip=1:atomic_load_census=1 %run %t lazyskip 2>&1 | FileCheck %s --check-prefixes=CLEAN,HITS
+// RUN: %env_tsan_opts=atomic_load_skip=1:atomic_load_skip_verify=1 %run %t lazyskip 2>&1 | FileCheck %s --check-prefix=CLEAN
+// RUN: %env_tsan_opts=atomic_load_skip=1:atomic_load_mutant=lazy-skip-empty %deflake %run %t lazyskip 2>&1 | FileCheck %s --check-prefix=RACE
+// RUN: %env_tsan_opts=atomic_load_skip=1:atomic_load_skip_verify=1:atomic_load_mutant=lazy-skip-empty not %run %t lazyskip 2>&1 | FileCheck %s --check-prefix=VERIFY
+// RUN: %run %t lazystale 2>&1 | FileCheck %s --check-prefix=CLEAN
+// RUN: %env_tsan_opts=atomic_load_skip=1:atomic_load_census=1 %run %t lazystale 2>&1 | FileCheck %s --check-prefixes=CLEAN,TRACK1
+// RUN: %env_tsan_opts=atomic_load_skip=1:atomic_load_skip_verify=1 %run %t lazystale 2>&1 | FileCheck %s --check-prefix=CLEAN
+// RUN: %env_tsan_opts=atomic_load_skip=1:atomic_load_mutant=lazy-stale %deflake %run %t lazystale 2>&1 | FileCheck %s --check-prefix=RACE
+// RUN: %env_tsan_opts=atomic_load_skip=1:atomic_load_skip_verify=1:atomic_load_mutant=lazy-stale not %run %t lazystale 2>&1 | FileCheck %s --check-prefix=VERIFY
 //
 // CLEAN-NOT:  WARNING: ThreadSanitizer
 // CLEAN-NOT:  ALS verify
@@ -108,6 +150,8 @@
 // SLOT:       ALS census{{.*}} 1 hits{{.*}} 1 the thread no longer owned its slot
 // NOSLOT:     ALS census{{.*}} 2 hits{{.*}} 0 the thread no longer owned its slot
 // VERIFY:     ALS verify: a hit on
+// TRACK0:     ; 0 versions started
+// TRACK1:     ; 1 versions started
 #include "test.h"
 #include <string.h>
 
@@ -163,6 +207,19 @@ __attribute__((disable_sanitizer_instrumentation)) static void swait(int i) {
   while (!sflag[i]) // no call into the runtime: nothing that takes the slot
     __asm__ volatile("" ::: "memory"); // lock, and no trace event either
 }
+// lazystale: W releases before any load; T starts the versions.
+static void *stale_writer(void *arg) {
+  g = 42;
+  __atomic_store_n(x, 1, __ATOMIC_RELEASE); // no load yet: no version kept
+  sset(0);
+  return 0;
+}
+static void *stale_starter(void *arg) {
+  swait(0);
+  long v = load(); // a miss: acquires W's release, starts the versions
+  sset(1);
+  return (void *)v;
+}
 static void *steal_loader(void *arg) {
   long acc = load(); // acquires: the address is in this thread's cache
   acc += load();     // a hit
@@ -200,9 +257,33 @@ int main(int argc, char **argv) {
     fprintf(stderr, "DONE %ld\n", gx);
     return 0;
   }
+  if (is("untracked")) {
+    long acc = 0;
+    for (int i = 0; i < 10; i++) {
+      __atomic_store_n(x, i, __ATOMIC_RELEASE);
+      acc += __atomic_fetch_add(x, 1, __ATOMIC_RELEASE);
+    }
+    fprintf(stderr, "DONE %ld\n", acc);
+    return 0;
+  }
+  if (is("lazystale")) {
+    pthread_t w, t;
+    pthread_create(&w, 0, stale_writer, 0);
+    pthread_create(&t, 0, stale_starter, 0);
+    swait(1);
+    long acc = load(); // must acquire W's release: T's version is not cached
+    acc += g;          // ordered after W's write only through that acquire
+    pthread_join(t, 0);
+    pthread_join(w, 0);
+    fprintf(stderr, "DONE %ld\n", acc);
+    return 0;
+  }
   if (is("reuse"))
     x = (long *)malloc(sizeof(long));
-  __atomic_store_n(x, 0, __ATOMIC_RELEASE); // the address has a sync object
+  if (is("lazyskip")) // a sync object with a null clock
+    __atomic_fetch_add(x, 0, __ATOMIC_ACQUIRE);
+  else
+    __atomic_store_n(x, 0, __ATOMIC_RELEASE); // the address has a sync object
   long acc = 0;
   for (int i = 0; i < 10; i++)
     acc += load(); // the first acquires, the others are hits

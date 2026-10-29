@@ -294,7 +294,9 @@ struct OpLoad {
       // locks that guard it. A writer that made the value read above set the
       // version to 0 before the value was visible and to a new one after its
       // clock change, so this load saw 0 or the new one, and the version
-      // cached cannot be either.
+      // cached cannot be either. A writer of an object no load had looked at
+      // kept no version (0), and the load that started one later named the
+      // clock as it stood after that writer (see the miss path).
       ThreadState::AlsEntry *e = nullptr;
       u64 ver = 0;
       bool hit = false;
@@ -355,7 +357,31 @@ struct OpLoad {
           // the reader lock; 0 is never cached). The empty version is not
           // cached either: it hits by itself, and the entry may hold another
           // address the thread still loads.
-          const u64 now = atomic_load(&s->als_ver, memory_order_relaxed);
+          u64 now = atomic_load(&s->als_ver, memory_order_relaxed);
+          if (now == kAlsUntracked) {
+            // No writer is between AlsBegin and AlsEnd (they hold s->mtx for
+            // writing), so 0 means no load has looked at s yet: writers have
+            // kept no version. Start one that names the clock as it stands
+            // (stable under the reader lock): empty if it is null, else a
+            // fresh one, which no earlier clock state has and so no entry
+            // holds. Never a version s had before: writers since then left
+            // it as it was (mutant lazy-stale: start at the empty one). From
+            // here on every writer keeps it (AlsBegin, AlsBump). Loads in
+            // the same state race to start it; the first wins and the others
+            // cache its version. Release: a thread that hits on the empty
+            // version set here then finds its slot as a global reset before
+            // this load left it (see ORDER above).
+            const u64 start =
+                (!s->clock && LIKELY(!als_no_empty)) || UNLIKELY(als_lazy_stale)
+                    ? kAlsEmpty
+                    : AlsFreshVer(thr);
+            if (atomic_compare_exchange_strong(&s->als_ver, &now, start,
+                                               memory_order_release)) {
+              now = start;
+              if (UNLIKELY(als_census))
+                thr->als_cnt[kAlsTrack]++;
+            }
+          }
           if (now > kAlsEmpty) {
             e->addr = (uptr)a;
             e->ver = now;
